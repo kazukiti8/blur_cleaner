@@ -1,0 +1,6 @@
+opencv-python
+pillow
+imagehash
+blake3
+send2trash
+pillow-heif

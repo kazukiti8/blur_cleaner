@@ -2,7 +2,6 @@ from __future__ import annotations
 import argparse
 from .scan import scan
 from .apply import apply_from_csv
-from .report_html import build_report
 
 def main(argv=None):
     p = argparse.ArgumentParser(
@@ -32,15 +31,6 @@ def main(argv=None):
     sapp.add_argument("--dry-run", action="store_true", help="Do not actually move files; just log actions")
     sapp.add_argument("--log-dir", default="", help="Directory to write applied_YYYYMMDD_HHMM.csv")
 
-    # report
-    srep = sub.add_parser("report", help="Build thumbnail-based HTML from report.csv")
-    srep.add_argument("--csv", dest="csv", default="report.csv", help="input report CSV")  # ← これだけにする
-    srep.add_argument("--out", dest="out", default="report.html")
-    srep.add_argument("--thumb-dir", dest="thumb_dir", default="")
-    srep.add_argument("--max-thumb", type=int, default=256)
-
-
-
     args = p.parse_args(argv)
 
     if args.cmd == "scan":
@@ -65,16 +55,6 @@ def main(argv=None):
             print(f"[OK] applied deletions for: {args.only}")
         else:
             print("[OK] applied deletions for: visual and blur (both)")
-
-    elif args.cmd == "report":
-        out, thumbs = build_report(
-            report_csv=args.csv,
-            out_html=args.out,
-            thumb_dir=(args.thumb_dir or None),
-            max_thumb=args.max_thumb,
-        )
-        print(f"[OK] report generated: {out}")
-        print(f"[OK] thumbnails: {thumbs}")
 
 if __name__ == "__main__":
     main()

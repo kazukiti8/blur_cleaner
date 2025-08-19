@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import json
 import threading
 import queue
 import tkinter as tk
@@ -13,9 +14,15 @@ from .thumbs import ThumbnailCache
 
 __all__ = ["main"]
 
+CONFIG_NAME = "scan_cshe_cfg.json"   # 設定ファイル名（対象フォルダ直下）
+CACHE_DB    = "scan_cshe"            # DBファイル名（対象フォルダ直下）
+
 # ------------ ユーティリティ ------------
 def _cache_path_for(target_dir: str) -> str:
-    return os.path.join(target_dir, "scan_cshe")
+    return os.path.join(target_dir, CACHE_DB)
+
+def _cfg_path_for(target_dir: str) -> str:
+    return os.path.join(target_dir, CONFIG_NAME)
 
 def _fmt_size(bytes_: int) -> str:
     try:
@@ -51,9 +58,8 @@ class BlurCleanerGUI(tk.Tk):
         self.geometry("1280x720")
         self.minsize(1120, 600)
 
-        # 状態
+        # 状態（拡張子は固定なので GUI では扱わない）
         self.var_target   = tk.StringVar(value="")
-        self.var_include  = tk.StringVar(value=".jpg;.jpeg;.png;.bmp;.gif;.webp;.tif;.tiff;.heic;.heif")
         self.var_exclude  = tk.StringVar(value="")
 
         # ブレ（既定: 自動p10）
@@ -68,6 +74,7 @@ class BlurCleanerGUI(tk.Tk):
         # 内部
         self._rows_all: List[Dict[str, str]] = []
         self._task_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self._last_loaded_target: Optional[str] = None  # 設定をいつ読み込んだかの追跡
 
         # ブレ表
         self._iid_path_blur: Dict[str, str] = {}
@@ -91,33 +98,32 @@ class BlurCleanerGUI(tk.Tk):
     def _build_ui(self):
         root = ttk.Frame(self); root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # 上段
+        # 上段（右にステータス、左に操作）
         ops1 = ttk.Frame(root); ops1.pack(fill=tk.X)
+
+        self.lbl_info = ttk.Label(ops1, text="準備OK")
+        self.lbl_info.pack(side=tk.RIGHT)
+
         ttk.Label(ops1, text="対象フォルダ:").pack(side=tk.LEFT)
-        ttk.Entry(ops1, textvariable=self.var_target, width=70).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ent = ttk.Entry(ops1, textvariable=self.var_target, width=70)
+        ent.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(ops1, text="参照...", command=self._browse_target).pack(side=tk.LEFT, padx=4)
         ttk.Button(ops1, text="オプション…", command=self._open_options_dialog).pack(side=tk.LEFT, padx=8)
         ttk.Button(ops1, text="スキャン開始", command=self._scan_clicked).pack(side=tk.LEFT, padx=8)
 
-        ops2 = ttk.Frame(root); ops2.pack(fill=tk.X, pady=(6, 2))
-        ttk.Label(ops2, text="拡張子:").pack(side=tk.LEFT)
-        ttk.Label(ops2, textvariable=self.var_include, foreground="#444").pack(side=tk.LEFT, padx=(2,10))
-        ttk.Label(ops2, text="除外:").pack(side=tk.LEFT)
-        ttk.Label(ops2, textvariable=self.var_exclude, foreground="#444").pack(side=tk.LEFT, padx=(2,10))
-        self.lbl_info = ttk.Label(ops2, text="準備OK"); self.lbl_info.pack(side=tk.RIGHT)
-
-        # 中段 split
-        split = ttk.Panedwindow(root, orient=tk.HORIZONTAL); split.pack(fill=tk.BOTH, expand=True, pady=(6,0))
+        # 中段：左右に分割
+        split = ttk.Panedwindow(root, orient=tk.HORIZONTAL); split.pack(fill=tk.BOTH, expand=True, pady=(8,0))
 
         # 左ペイン：ボタンバー + Notebook(2タブ)
         left = ttk.Frame(split); split.add(left, weight=3)
-
         btnbar = ttk.Frame(left); btnbar.pack(fill=tk.X, pady=(0,4))
         ttk.Label(btnbar, text="結果タブ:").pack(side=tk.LEFT)
+
+        self.nb = ttk.Notebook(left)
         ttk.Button(btnbar, text="ブレ結果", command=lambda: self.nb.select(self.tab_blur)).pack(side=tk.LEFT, padx=(6,2))
         ttk.Button(btnbar, text="類似結果", command=lambda: self.nb.select(self.tab_vis)).pack(side=tk.LEFT, padx=2)
 
-        self.nb = ttk.Notebook(left); self.nb.pack(fill=tk.BOTH, expand=True)
+        self.nb.pack(fill=tk.BOTH, expand=True)
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # タブ：ブレ
@@ -182,12 +188,73 @@ class BlurCleanerGUI(tk.Tk):
 
         self._show_preview("none")
 
+    # ---------- 設定 永続化 ----------
+    def _load_settings_if_needed(self):
+        """スキャン直前など、まだ読んでなければ読む（手入力対応）"""
+        target = self.var_target.get().strip()
+        if not target or not os.path.isdir(target):
+            return
+        if self._last_loaded_target == target:
+            return
+        self._load_settings(target)
+
+    def _load_settings(self, target_dir: str):
+        cfg = _cfg_path_for(target_dir)
+        if not os.path.isfile(cfg):
+            self._last_loaded_target = target_dir
+            self.lbl_info.config(text=f"[INFO] 設定ファイルなし（{CONFIG_NAME}）")
+            return
+        try:
+            with open(cfg, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception as e:
+            self._last_loaded_target = target_dir
+            self.lbl_info.config(text=f"[WARN] 設定読込失敗: {e}")
+            return
+
+        # 読込（存在するキーのみ反映）
+        self.var_exclude.set(data.get("exclude", self.var_exclude.get()))
+        self.var_blur_auto.set(bool(data.get("blur_auto", self.var_blur_auto.get())))
+        self.var_blur_pct.set(int(data.get("blur_pct", self.var_blur_pct.get())))
+        self.var_blur_thr.set(float(data.get("blur_thr", self.var_blur_thr.get())))
+        self.var_similar.set(bool(data.get("visual", self.var_similar.get())))
+        self.var_phash_d.set(int(data.get("phash_d", self.var_phash_d.get())))
+
+        self._last_loaded_target = target_dir
+        self.lbl_info.config(text=f"[OK] 設定読込: {CONFIG_NAME}")
+
+    def _save_settings(self, target_dir: str):
+        if not target_dir or not os.path.isdir(target_dir):
+            self.lbl_info.config(text="[WARN] 設定保存先の対象フォルダが無効です")
+            return
+        cfg = _cfg_path_for(target_dir)
+        data = dict(
+            exclude=self.var_exclude.get().strip(),
+            blur_auto=bool(self.var_blur_auto.get()),
+            blur_pct=int(self.var_blur_pct.get()),
+            blur_thr=float(self.var_blur_thr.get()),
+            visual=bool(self.var_similar.get()),
+            phash_d=int(self.var_phash_d.get()),
+            # 拡張子は固定運用のため未保存
+        )
+        try:
+            with open(cfg, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=2)
+            self.lbl_info.config(text=f"[OK] 設定保存: {CONFIG_NAME}")
+        except Exception as e:
+            self.lbl_info.config(text=f"[ERROR] 設定保存失敗: {e}")
+
     # ---------- オプション ----------
     def _open_options_dialog(self):
+        target = self.var_target.get().strip()
+        if target and os.path.isdir(target):
+            # 既に別の場所で設定が作られていた場合に備え、開く前にも一度読込
+            self._load_settings(target)
+
         dlg = TabbedSettingsDialog(
             self,
             target_dir=self.var_target.get(),
-            include=self.var_include.get(),
+            include=".jpeg;.jpg;.png;.webp",  # 固定表示
             exclude=self.var_exclude.get(),
             blur_auto=self.var_blur_auto.get(),
             blur_pct=self.var_blur_pct.get(),
@@ -197,20 +264,27 @@ class BlurCleanerGUI(tk.Tk):
         )
         if dlg.result:
             r = dlg.result
-            self.var_include.set(r["include"] or "")
-            self.var_exclude.set(r["exclude"] or "")
-            self.var_blur_auto.set(bool(r["blur_auto"]))
-            self.var_blur_pct.set(int(r["blur_pct"]))
-            self.var_blur_thr.set(float(r["blur_thr"]))
-            self.var_similar.set(bool(r["visual"]))
-            self.var_phash_d.set(int(r["phash_d"]))
+            # 反映
+            self.var_exclude.set(r.get("exclude", ""))
+            self.var_blur_auto.set(bool(r.get("blur_auto", True)))
+            self.var_blur_pct.set(int(r.get("blur_pct", 10)))
+            self.var_blur_thr.set(float(r.get("blur_thr", 400.0)))
+            self.var_similar.set(bool(r.get("visual", False)))
+            self.var_phash_d.set(int(r.get("phash_d", 6)))
             self.lbl_info.config(text="[OK] オプションを更新しました")
+
+            # 保存（対象フォルダが有効なら）
+            target = self.var_target.get().strip()
+            if target and os.path.isdir(target):
+                self._save_settings(target)
 
     # ---------- イベント ----------
     def _browse_target(self):
         d = filedialog.askdirectory(title="対象フォルダを選択")
         if d:
             self.var_target.set(d)
+            # フォルダ選択直後に設定を読み込む
+            self._load_settings(d)
 
     def _on_tab_changed(self, event=None):
         mode = "blur" if self.nb.index(self.nb.select()) == 0 else "visual"
@@ -218,6 +292,9 @@ class BlurCleanerGUI(tk.Tk):
 
     # ---------- スキャン/適用 ----------
     def _scan_clicked(self):
+        # 手入力でターゲットを書き換えたケースに備えて、直前に読込
+        self._load_settings_if_needed()
+
         target = self.var_target.get().strip()
         if not target or not os.path.isdir(target):
             messagebox.showerror("エラー", "対象フォルダが正しくありません。")
@@ -244,7 +321,9 @@ class BlurCleanerGUI(tk.Tk):
         try:
             target = self.var_target.get().strip()
             dbpath = _cache_path_for(target)
-            include = [s.strip() for s in self.var_include.get().split(";") if s.strip()] or None
+
+            # scan 側で拡張子は固定（.jpeg;.jpg;.png;.webp のみ）
+            include = None  # 固定のため渡さない
             exclude = [s.strip() for s in self.var_exclude.get().split(";") if s.strip()] or None
 
             do_similar = bool(self.var_similar.get())
@@ -435,7 +514,6 @@ class BlurCleanerGUI(tk.Tk):
 
     # ---------- プレビュー ----------
     def _show_preview(self, mode: str, single: Optional[str]=None, left: Optional[str]=None, right: Optional[str]=None):
-        # キャンバス初期化
         for c in (getattr(self, "canvas_single", None), getattr(self, "canvas_keep", None), getattr(self, "canvas_cand", None)):
             if c: c.delete("all")
         if mode == "single" and single:

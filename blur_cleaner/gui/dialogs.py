@@ -6,10 +6,13 @@ from typing import Dict, Any, Optional
 
 __all__ = ["TabbedSettingsDialog"]
 
+FIXED_EXT_TEXT = ".jpeg;.jpg;.png;.webp"
+
 class TabbedSettingsDialog(tk.Toplevel):
     """
     タブ: スキャン条件 / ブレ設定 / 類似設定
     ※ キャッシュDBは target_dir/scan_cshe に固定（表示のみ）
+    ※ 拡張子は固定: jpeg / jpg / png / webp
     """
     def __init__(self, master,
                  target_dir: str,
@@ -24,7 +27,8 @@ class TabbedSettingsDialog(tk.Toplevel):
 
         # 値
         self.var_target    = tk.StringVar(value=target_dir)
-        self.var_include   = tk.StringVar(value=include)
+        # 拡張子は固定表示（内部値も固定文字列で持つが、保存時に参照はしない）
+        self.var_include   = tk.StringVar(value=FIXED_EXT_TEXT)
         self.var_exclude   = tk.StringVar(value=exclude)
         self.var_cacheinfo = tk.StringVar(value=self._build_cache_info(target_dir))
 
@@ -40,13 +44,24 @@ class TabbedSettingsDialog(tk.Toplevel):
 
         # --- スキャン条件 ---
         tab_scan = ttk.Frame(nb); nb.add(tab_scan, text="スキャン条件")
-        trow = ttk.Frame(tab_scan); trow.pack(fill=tk.X, padx=6, pady=(6,0))
+
+        # 注意書き（このタブだけに表示／グレー）
+        note = ttk.Label(
+            tab_scan,
+            text="対応拡張子：jpeg / jpg / png / webp のみ（固定）",
+            foreground="gray"
+        )
+        note.pack(anchor="w", padx=8, pady=(8, 4))
+
+        trow = ttk.Frame(tab_scan); trow.pack(fill=tk.X, padx=6, pady=(2,0))
         ttk.Label(trow, text="対象フォルダ:").pack(side=tk.LEFT)
         ttk.Label(trow, textvariable=self.var_target, foreground="#444").pack(side=tk.LEFT, padx=(4,0))
 
-        sec1 = ttk.LabelFrame(tab_scan, text="拡張子（;区切り 例: .jpg;.png;.jpeg）")
+        # 拡張子（固定・編集不可）
+        sec1 = ttk.LabelFrame(tab_scan, text="拡張子（固定）")
         sec1.pack(fill=tk.X, padx=6, pady=(8,4))
-        ttk.Entry(sec1, textvariable=self.var_include, width=64).pack(fill=tk.X, padx=8, pady=6)
+        ent_inc = ttk.Entry(sec1, textvariable=self.var_include, width=64, state="disabled")
+        ent_inc.pack(fill=tk.X, padx=8, pady=6)
 
         sec2 = ttk.LabelFrame(tab_scan, text="除外（パスに含む文字列を;区切り 例: thumb;backup;@eaDir）")
         sec2.pack(fill=tk.X, padx=6, pady=(4,6))
@@ -55,12 +70,6 @@ class TabbedSettingsDialog(tk.Toplevel):
         info = ttk.LabelFrame(tab_scan, text="キャッシュ（自動）")
         info.pack(fill=tk.X, padx=6, pady=(0,8))
         ttk.Label(info, textvariable=self.var_cacheinfo, foreground="#555", justify="left").pack(fill=tk.X, padx=8, pady=6)
-
-        pres = ttk.Frame(tab_scan); pres.pack(fill=tk.X, padx=6, pady=(0,6))
-        ttk.Label(pres, text="プリセット:").pack(side=tk.LEFT)
-        ttk.Button(pres, text="写真（JPG/PNG）", command=self._preset_photo).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pres, text="写真+RAW", command=self._preset_photo_raw).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pres, text="除外:サムネ/バックアップ", command=self._preset_exclude).pack(side=tk.LEFT, padx=4)
 
         # --- ブレ設定 ---
         tab_blur = ttk.Frame(nb); nb.add(tab_blur, text="ブレ設定")
@@ -103,17 +112,11 @@ class TabbedSettingsDialog(tk.Toplevel):
             return "キャッシュ先: （対象フォルダ未選択）\nファイル名: scan_cshe"
         return f"キャッシュ先: {os.path.join(target_dir, 'scan_cshe')}\nファイル名: scan_cshe（SQLite）\n※ 削除しても再スキャンで自動再生成されます。"
 
-    def _preset_photo(self): self.var_include.set(".jpg;.jpeg;.png")
-    def _preset_photo_raw(self): self.var_include.set(".jpg;.jpeg;.png;.heic;.heif;.arw;.cr2;.nef")
-    def _preset_exclude(self):
-        base = self.var_exclude.get().strip()
-        add = "thumb;thumbnails;backup;_bak;@eaDir;.AppleDouble"
-        self.var_exclude.set(add if not base else (base + ";" + add))
-
     def _sync_blur_state(self):
         self.ent_thr.configure(state=("disabled" if self.var_blur_auto.get() else "normal"))
 
     def _ok(self):
+        # include は固定だが、互換のため値は返す（実処理では scan 側の固定フィルタが有効）
         self.result = dict(
             include=self.var_include.get().strip(),
             exclude=self.var_exclude.get().strip(),

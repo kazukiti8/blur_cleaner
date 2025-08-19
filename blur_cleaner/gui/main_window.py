@@ -16,6 +16,8 @@ __all__ = ["main"]
 
 CONFIG_NAME = "scan_cshe_cfg.json"   # 設定ファイル名（対象フォルダ直下）
 CACHE_DB    = "scan_cshe"            # DBファイル名（対象フォルダ直下）
+PHASH_DIST  = 6                      # 類似距離は固定
+DO_SIMILAR  = True                   # 類似判定は常時ON
 
 # ------------ ユーティリティ ------------
 def _cache_path_for(target_dir: str) -> str:
@@ -67,14 +69,10 @@ class BlurCleanerGUI(tk.Tk):
         self.var_blur_pct  = tk.IntVar(value=10)
         self.var_blur_thr  = tk.DoubleVar(value=400.0)
 
-        # 類似
-        self.var_similar   = tk.BooleanVar(value=False)
-        self.var_phash_d   = tk.IntVar(value=6)
-
         # 内部
         self._rows_all: List[Dict[str, str]] = []
         self._task_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
-        self._last_loaded_target: Optional[str] = None  # 設定をいつ読み込んだかの追跡
+        self._last_loaded_target: Optional[str] = None
 
         # ブレ表
         self._iid_path_blur: Dict[str, str] = {}
@@ -91,6 +89,9 @@ class BlurCleanerGUI(tk.Tk):
         self._preview_w_pair   = 440
         self._preview_h_pair   = 320
 
+        # 進捗バー
+        self.pb = None
+
         self._build_ui()
         self._poll_queue()
 
@@ -98,15 +99,17 @@ class BlurCleanerGUI(tk.Tk):
     def _build_ui(self):
         root = ttk.Frame(self); root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # 上段（右にステータス、左に操作）
+        # 上段（右にステータス＋進捗バー、左に操作）
         ops1 = ttk.Frame(root); ops1.pack(fill=tk.X)
 
-        self.lbl_info = ttk.Label(ops1, text="準備OK")
-        self.lbl_info.pack(side=tk.RIGHT)
+        right = ttk.Frame(ops1); right.pack(side=tk.RIGHT)
+        self.lbl_info = ttk.Label(right, text="準備OK")
+        self.lbl_info.pack(side=tk.TOP, anchor="e")
+        self.pb = ttk.Progressbar(right, orient="horizontal", mode="determinate", length=240, maximum=100)
+        self.pb.pack(side=tk.TOP, pady=(2,0), anchor="e")
 
         ttk.Label(ops1, text="対象フォルダ:").pack(side=tk.LEFT)
-        ent = ttk.Entry(ops1, textvariable=self.var_target, width=70)
-        ent.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Entry(ops1, textvariable=self.var_target, width=70).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(ops1, text="参照...", command=self._browse_target).pack(side=tk.LEFT, padx=4)
         ttk.Button(ops1, text="オプション…", command=self._open_options_dialog).pack(side=tk.LEFT, padx=8)
         ttk.Button(ops1, text="スキャン開始", command=self._scan_clicked).pack(side=tk.LEFT, padx=8)
@@ -190,7 +193,6 @@ class BlurCleanerGUI(tk.Tk):
 
     # ---------- 設定 永続化 ----------
     def _load_settings_if_needed(self):
-        """スキャン直前など、まだ読んでなければ読む（手入力対応）"""
         target = self.var_target.get().strip()
         if not target or not os.path.isdir(target):
             return
@@ -212,13 +214,11 @@ class BlurCleanerGUI(tk.Tk):
             self.lbl_info.config(text=f"[WARN] 設定読込失敗: {e}")
             return
 
-        # 読込（存在するキーのみ反映）
+        # 類似系は常時ONのため読込不要
         self.var_exclude.set(data.get("exclude", self.var_exclude.get()))
         self.var_blur_auto.set(bool(data.get("blur_auto", self.var_blur_auto.get())))
         self.var_blur_pct.set(int(data.get("blur_pct", self.var_blur_pct.get())))
         self.var_blur_thr.set(float(data.get("blur_thr", self.var_blur_thr.get())))
-        self.var_similar.set(bool(data.get("visual", self.var_similar.get())))
-        self.var_phash_d.set(int(data.get("phash_d", self.var_phash_d.get())))
 
         self._last_loaded_target = target_dir
         self.lbl_info.config(text=f"[OK] 設定読込: {CONFIG_NAME}")
@@ -233,9 +233,7 @@ class BlurCleanerGUI(tk.Tk):
             blur_auto=bool(self.var_blur_auto.get()),
             blur_pct=int(self.var_blur_pct.get()),
             blur_thr=float(self.var_blur_thr.get()),
-            visual=bool(self.var_similar.get()),
-            phash_d=int(self.var_phash_d.get()),
-            # 拡張子は固定運用のため未保存
+            # 類似系は固定のため保存しない
         )
         try:
             with open(cfg, "w", encoding="utf-8") as fp:
@@ -248,7 +246,6 @@ class BlurCleanerGUI(tk.Tk):
     def _open_options_dialog(self):
         target = self.var_target.get().strip()
         if target and os.path.isdir(target):
-            # 既に別の場所で設定が作られていた場合に備え、開く前にも一度読込
             self._load_settings(target)
 
         dlg = TabbedSettingsDialog(
@@ -259,8 +256,6 @@ class BlurCleanerGUI(tk.Tk):
             blur_auto=self.var_blur_auto.get(),
             blur_pct=self.var_blur_pct.get(),
             blur_thr=self.var_blur_thr.get(),
-            visual_enabled=self.var_similar.get(),
-            phash_dist=self.var_phash_d.get(),
         )
         if dlg.result:
             r = dlg.result
@@ -269,11 +264,9 @@ class BlurCleanerGUI(tk.Tk):
             self.var_blur_auto.set(bool(r.get("blur_auto", True)))
             self.var_blur_pct.set(int(r.get("blur_pct", 10)))
             self.var_blur_thr.set(float(r.get("blur_thr", 400.0)))
-            self.var_similar.set(bool(r.get("visual", False)))
-            self.var_phash_d.set(int(r.get("phash_d", 6)))
             self.lbl_info.config(text="[OK] オプションを更新しました")
 
-            # 保存（対象フォルダが有効なら）
+            # 保存
             target = self.var_target.get().strip()
             if target and os.path.isdir(target):
                 self._save_settings(target)
@@ -283,7 +276,6 @@ class BlurCleanerGUI(tk.Tk):
         d = filedialog.askdirectory(title="対象フォルダを選択")
         if d:
             self.var_target.set(d)
-            # フォルダ選択直後に設定を読み込む
             self._load_settings(d)
 
     def _on_tab_changed(self, event=None):
@@ -292,7 +284,6 @@ class BlurCleanerGUI(tk.Tk):
 
     # ---------- スキャン/適用 ----------
     def _scan_clicked(self):
-        # 手入力でターゲットを書き換えたケースに備えて、直前に読込
         self._load_settings_if_needed()
 
         target = self.var_target.get().strip()
@@ -321,33 +312,35 @@ class BlurCleanerGUI(tk.Tk):
         try:
             target = self.var_target.get().strip()
             dbpath = _cache_path_for(target)
-
-            # scan 側で拡張子は固定（.jpeg;.jpg;.png;.webp のみ）
-            include = None  # 固定のため渡さない
             exclude = [s.strip() for s in self.var_exclude.get().split(";") if s.strip()] or None
 
-            do_similar = bool(self.var_similar.get())
-            phash_d = int(self.var_phash_d.get())
+            # 進捗通知コールバック
+            def _prog(phase: str, cur: int, tot: int):
+                self._task_q.put(("progress", {"phase": phase, "current": cur, "total": tot}))
 
             # ブレ閾値（自動→統計1パス）
             thr = float(self.var_blur_thr.get())
+            _rows_tmp, stats = scan(
+                target_dir=target, report_csv=None, dbpath=dbpath,
+                blur_threshold=1e9, do_similar=DO_SIMILAR, phash_distance=PHASH_DIST,
+                include_exts=None, exclude_substr=exclude, collect_stats=True,
+                progress_cb=_prog,
+            ) if self.var_blur_auto.get() else (None, None)
+
             if self.var_blur_auto.get():
-                _rows_tmp, stats = scan(
-                    target_dir=target, report_csv=None, dbpath=dbpath,
-                    blur_threshold=1e9, do_similar=do_similar, phash_distance=phash_d,
-                    include_exts=include, exclude_substr=exclude, collect_stats=True,
-                )
-                auto_thr = _pick_auto_threshold_from_stats(stats, self.var_blur_pct.get())
+                auto_thr = _pick_auto_threshold_from_stats(stats, self.var_blur_pct.get()) if stats else None
                 if auto_thr is not None:
                     thr = float(auto_thr)
                     self._task_q.put(("msg", f"[AUTO] ブレしきい値 = {thr:.1f}（下位{self.var_blur_pct.get()}%）"))
                 else:
                     self._task_q.put(("msg", f"[WARN] 自動しきい値の取得に失敗。手動値 {thr:.1f} を使用します。"))
 
+            # 本番スキャン
             rows = scan(
                 target_dir=target, report_csv=None, dbpath=dbpath,
-                blur_threshold=thr, do_similar=do_similar, phash_distance=phash_d,
-                include_exts=include, exclude_substr=exclude, collect_stats=False,
+                blur_threshold=thr, do_similar=DO_SIMILAR, phash_distance=PHASH_DIST,
+                include_exts=None, exclude_substr=exclude, collect_stats=False,
+                progress_cb=_prog,
             )
             self._rows_all = rows
 
@@ -404,6 +397,15 @@ class BlurCleanerGUI(tk.Tk):
                     self.lbl_info.config(text=str(payload))
                 elif kind == "error":
                     self.lbl_info.config(text=str(payload)); messagebox.showerror("エラー", str(payload))
+                elif kind == "progress":
+                    cur = int(payload.get("current", 0))
+                    tot = max(1, int(payload.get("total", 1)))
+                    pct = int(cur * 100 / tot)
+                    phase = payload.get("phase", "scan")
+                    if self.pb:
+                        self.pb["maximum"] = 100
+                        self.pb["value"] = pct
+                    self.lbl_info.config(text=f"[{phase}] {cur}/{tot}  ({pct}%)")
                 elif kind == "table_blur":
                     self._reload_table_blur(payload)
                 elif kind == "table_vis":
@@ -546,8 +548,15 @@ class BlurCleanerGUI(tk.Tk):
 
     # ---------- Busy ----------
     def _start_busy(self, text: str):
-        self.lbl_info.config(text=text); self.config(cursor="watch"); self.update_idletasks()
+        self.lbl_info.config(text=text)
+        if self.pb:
+            self.pb["maximum"] = 100
+            self.pb["value"] = 0
+        self.config(cursor="watch"); self.update_idletasks()
+
     def _end_busy(self):
+        if self.pb:
+            self.pb["value"] = 0
         self.config(cursor=""); self.update_idletasks()
 
 # --------- 起動 ----------

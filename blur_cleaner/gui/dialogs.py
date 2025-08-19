@@ -10,15 +10,18 @@ FIXED_EXT_TEXT = ".jpeg;.jpg;.png;.webp"
 
 class TabbedSettingsDialog(tk.Toplevel):
     """
-    タブ: スキャン条件 / ブレ設定 / 類似設定
+    タブ: スキャン条件 / ブレ設定
     ※ キャッシュDBは target_dir/scan_cshe に固定（表示のみ）
     ※ 拡張子は固定: jpeg / jpg / png / webp
+    ※ 類似判定は常時ONのためUIは無し
     """
     def __init__(self, master,
                  target_dir: str,
-                 include: str, exclude: str,
-                 blur_auto: bool, blur_pct: int, blur_thr: float,
-                 visual_enabled: bool, phash_dist: int):
+                 include: str,
+                 exclude: str,
+                 blur_auto: bool,
+                 blur_pct: int,
+                 blur_thr: float):
         super().__init__(master)
         self.title("オプション")
         self.resizable(False, False)
@@ -27,8 +30,7 @@ class TabbedSettingsDialog(tk.Toplevel):
 
         # 値
         self.var_target    = tk.StringVar(value=target_dir)
-        # 拡張子は固定表示（内部値も固定文字列で持つが、保存時に参照はしない）
-        self.var_include   = tk.StringVar(value=FIXED_EXT_TEXT)
+        self.var_include   = tk.StringVar(value=FIXED_EXT_TEXT)  # 固定表示のみ
         self.var_exclude   = tk.StringVar(value=exclude)
         self.var_cacheinfo = tk.StringVar(value=self._build_cache_info(target_dir))
 
@@ -36,16 +38,12 @@ class TabbedSettingsDialog(tk.Toplevel):
         self.var_blur_pct  = tk.IntVar(value=blur_pct)
         self.var_blur_thr  = tk.DoubleVar(value=blur_thr)
 
-        self.var_visual    = tk.BooleanVar(value=visual_enabled)
-        self.var_phash_d   = tk.IntVar(value=phash_dist)
-
         frm = ttk.Frame(self, padding=10); frm.pack(fill=tk.BOTH, expand=True)
         nb = ttk.Notebook(frm); nb.pack(fill=tk.BOTH, expand=True)
 
         # --- スキャン条件 ---
         tab_scan = ttk.Frame(nb); nb.add(tab_scan, text="スキャン条件")
 
-        # 注意書き（このタブだけに表示／グレー）
         note = ttk.Label(
             tab_scan,
             text="対応拡張子：jpeg / jpg / png / webp のみ（固定）",
@@ -57,11 +55,9 @@ class TabbedSettingsDialog(tk.Toplevel):
         ttk.Label(trow, text="対象フォルダ:").pack(side=tk.LEFT)
         ttk.Label(trow, textvariable=self.var_target, foreground="#444").pack(side=tk.LEFT, padx=(4,0))
 
-        # 拡張子（固定・編集不可）
         sec1 = ttk.LabelFrame(tab_scan, text="拡張子（固定）")
         sec1.pack(fill=tk.X, padx=6, pady=(8,4))
-        ent_inc = ttk.Entry(sec1, textvariable=self.var_include, width=64, state="disabled")
-        ent_inc.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Entry(sec1, textvariable=self.var_include, width=64, state="disabled").pack(fill=tk.X, padx=8, pady=6)
 
         sec2 = ttk.LabelFrame(tab_scan, text="除外（パスに含む文字列を;区切り 例: thumb;backup;@eaDir）")
         sec2.pack(fill=tk.X, padx=6, pady=(4,6))
@@ -78,23 +74,13 @@ class TabbedSettingsDialog(tk.Toplevel):
                         command=lambda: self._sync_blur_state()).pack(side=tk.LEFT)
         ttk.Spinbox(b1, from_=1, to=50, textvariable=self.var_blur_pct, width=6).pack(side=tk.LEFT, padx=(6,2))
         ttk.Label(b1, text="%").pack(side=tk.LEFT)
+
         b2 = ttk.Frame(tab_blur); b2.pack(fill=tk.X, padx=6, pady=(8,6))
         ttk.Label(b2, text="手動しきい値:").pack(side=tk.LEFT)
         self.ent_thr = ttk.Entry(b2, textvariable=self.var_blur_thr, width=10)
         self.ent_thr.pack(side=tk.LEFT, padx=(6,0))
         ttk.Label(tab_blur, foreground="#555",
                   text="※ 自動ON: データの下位%（ブレが強い側）で自動設定。OFF: 上の値を使用。値が小さいほどブレ扱い。"
-        ).pack(fill=tk.X, padx=8, pady=(4,8))
-
-        # --- 類似設定 ---
-        tab_vis = ttk.Frame(nb); nb.add(tab_vis, text="類似設定")
-        v1 = ttk.Frame(tab_vis); v1.pack(fill=tk.X, padx=6, pady=(8,2))
-        ttk.Checkbutton(v1, text="類似判定を有効化（pHash）", variable=self.var_visual).pack(side=tk.LEFT)
-        v2 = ttk.Frame(tab_vis); v2.pack(fill=tk.X, padx=6, pady=(8,6))
-        ttk.Label(v2, text="pHash距離（小さいほど厳密）:").pack(side=tk.LEFT)
-        ttk.Spinbox(v2, from_=0, to=32, textvariable=self.var_phash_d, width=6).pack(side=tk.LEFT, padx=(6,0))
-        ttk.Label(tab_vis, foreground="#555",
-                  text="※ 距離0はほぼ同一。6前後が実用ライン。大きすぎると誤検出が増える。"
         ).pack(fill=tk.X, padx=8, pady=(4,8))
 
         # --- ボタン ---
@@ -116,15 +102,12 @@ class TabbedSettingsDialog(tk.Toplevel):
         self.ent_thr.configure(state=("disabled" if self.var_blur_auto.get() else "normal"))
 
     def _ok(self):
-        # include は固定だが、互換のため値は返す（実処理では scan 側の固定フィルタが有効）
         self.result = dict(
-            include=self.var_include.get().strip(),
+            include=self.var_include.get().strip(),  # 固定（互換のため返すだけ）
             exclude=self.var_exclude.get().strip(),
             blur_auto=bool(self.var_blur_auto.get()),
             blur_pct=int(self.var_blur_pct.get()),
             blur_thr=float(self.var_blur_thr.get()),
-            visual=bool(self.var_visual.get()),
-            phash_d=int(self.var_phash_d.get()),
         )
         self.destroy()
 

@@ -1,191 +1,161 @@
+# apply.py - ごみ箱送り適用ロジック（日本語コメント）
 from __future__ import annotations
-import csv, os, datetime
-from typing import Optional, Set, Iterable
-from .trash import to_trash
+import os, csv, datetime
+from typing import Iterable, Dict, Optional, List
+from .trash import to_trash  # send2trash を内包した関数想定
 
-REQUIRED_FIELDS = {"type","domain","group","keep","candidate","relation"}
+# スキャン結果のフィールド想定
+FIELDS = ["type", "domain", "group", "keep", "candidate", "relation"]
 
-def _exists(p: str) -> bool:
+def _iter_candidates(rows: Iterable[Dict[str, str]], only: Optional[str] = None):
+    """
+    適用対象ファイルのパスを列挙するジェネレータ。
+    only: None → 両方, "blur" → ブレ単独のみ, "visual" → 類似（重複）のみ
+    """
+    for r in rows:
+        t = (r.get("type") or "").strip()
+        d = (r.get("domain") or "").strip()
+
+        if only == "blur":
+            if not (t == "blur_single" and d == "single"):
+                continue
+        elif only == "visual":
+            if not (t == "visual" and d == "group"):
+                continue
+        else:
+            # 両方（blur_single/single, visual/group）
+            if not ((t == "blur_single" and d == "single") or (t == "visual" and d == "group")):
+                continue
+
+        if t == "visual":
+            # 類似（重複）は keep 以外（=candidate）を削除対象
+            cand = (r.get("candidate") or "").strip()
+            keep = (r.get("keep") or "").strip()
+            if cand and cand != keep:
+                yield cand
+        else:
+            # ブレ単独は candidate を削除対象
+            cand = (r.get("candidate") or "").strip()
+            if cand:
+                yield cand
+
+def _norm_abs(path: str) -> str:
+    """Windows前提：絶対パス化。大文字小文字は区別しない想定なので lower() はしない。"""
     try:
-        return os.path.exists(p)
+        return os.path.abspath(path)
     except Exception:
+        return path
+
+def _is_protected(target_abs: str, protect_list: Optional[List[str]]) -> bool:
+    """
+    保護パスに一致するかを判定。
+    - ファイル一致
+    - フォルダ配下（末尾セパレータ考慮）
+    """
+    if not protect_list:
         return False
-
-def _norm(p: str) -> str:
-    # Windows想定：大文字小文字・区切りを正規化
-    try:
-        return os.path.normcase(os.path.normpath(os.path.abspath(p)))
-    except Exception:
-        return p
-
-def _parse_list(s: Optional[str]) -> list[str]:
-    # セミコロン/カンマ/改行で区切り
-    if not s: return []
-    parts = []
-    for token in s.replace(",", ";").split(";"):
-        t = token.strip()
-        if t:
-            parts.append(t)
-    return parts
-
-def _in_protect(cand: str, protect_paths: Iterable[str]) -> bool:
-    c = _norm(cand)
-    for base in protect_paths:
-        nb = _norm(base)
-        # パス一致 or サブパスなら保護
-        if c == nb: return True
-        if c.startswith(nb + os.sep): return True
+    t = _norm_abs(target_abs)
+    for p in protect_list:
+        if not p:
+            continue
+        base = _norm_abs(p)
+        if os.path.isdir(base):
+            # フォルダ配下
+            if t.startswith(base.rstrip("\\/") + os.sep):
+                return True
+        else:
+            # ファイル一致
+            if t == base:
+                return True
     return False
 
-def _open_log(csv_src_path: str, log_dir: Optional[str]) -> tuple[csv.writer, any, str]:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = (log_dir if log_dir else os.path.dirname(os.path.abspath(csv_src_path))) or "."
-    os.makedirs(base_dir, exist_ok=True)
-    out_path = os.path.join(base_dir, f"applied_{ts}.csv")
-    fp = open(out_path, "w", newline="", encoding="utf-8")
-    w = csv.writer(fp)
-    w.writerow(["ts","mode","status","type","domain","group","keep","candidate","relation","note"])
-    return w, fp, out_path
+def apply_from_rows(
+    rows: Iterable[Dict[str, str]],
+    only: Optional[str] = None,                 # "blur" / "visual" / None（両方）
+    protect: Optional[List[str]] = None,        # 保護したいファイル/フォルダのリスト
+    max_move: Optional[int] = None,             # 1回の実行で移動する最大件数（Noneで無制限）
+    dry_run: bool = False,                      # Trueなら実際にはごみ箱へ送らずカウントのみ
+    log_dir: Optional[str] = None,              # ログCSVを出力するフォルダ。Noneで出力しない
+) -> Dict[str, object]:
+    """
+    スキャン結果（行リスト）から、ごみ箱へ送る。
+    戻り値: {"moved":int, "missing":int, "errors":int, "total":int, "log_path": Optional[str]}
+    """
+    protect_list = protect or []
+    moved = 0
+    missing = 0
+    errors = 0
+    total = 0
+
+    log_rows = []
+    for cand in _iter_candidates(rows, only=only):
+        total += 1
+        ap = _norm_abs(cand)
+
+        # 保護対象ならスキップ
+        if _is_protected(ap, protect_list):
+            log_rows.append({"path": ap, "result": "skip_protected"})
+            continue
+
+        # 実在チェック
+        if not os.path.exists(ap):
+            missing += 1
+            log_rows.append({"path": ap, "result": "missing"})
+            continue
+
+        if dry_run:
+            moved += 1
+            log_rows.append({"path": ap, "result": "dry_run"})
+        else:
+            try:
+                to_trash(ap)
+                moved += 1
+                log_rows.append({"path": ap, "result": "moved"})
+            except Exception as e:
+                errors += 1
+                log_rows.append({"path": ap, "result": f"error:{e}"})
+
+        if max_move is not None and moved >= max_move:
+            # 上限に達したら終了
+            break
+
+    # ログ出力
+    log_path = None
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(log_dir, f"applied_{ts}.csv")
+            with open(log_path, "w", newline="", encoding="utf-8") as fp:
+                w = csv.DictWriter(fp, fieldnames=["path", "result"])
+                w.writeheader()
+                w.writerows(log_rows)
+        except Exception:
+            # ログ出力に失敗しても致命ではないので握りつぶす
+            log_path = None
+
+    return {"moved": moved, "missing": missing, "errors": errors, "total": total, "log_path": log_path}
 
 def apply_from_csv(
-    csv_path: str = "report.csv",
+    csv_path: str,
     only: Optional[str] = None,
-    protect: Optional[str] = None,
+    protect: Optional[List[str]] = None,
     max_move: Optional[int] = None,
-    confirm: bool = False,
     dry_run: bool = False,
     log_dir: Optional[str] = None,
-):
+) -> Dict[str, object]:
     """
-    only:
-      - None       : visual と blur の両方を適用（※慎重に）
-      - "visual"   : 見た目グループ（duplicate+similar）だけ適用
-      - "blur"     : ブレ単独だけ適用
-    protect: セミコロン(;)区切りの保護パス（フォルダ/ファイル）。配下はスキップ
-    max_move: この実行でごみ箱へ送る上限枚数（超えたら以降はスキップ）
-    confirm: True の場合、実行前に枚数を表示して Y/N 確認
-    dry_run: True の場合、実際には移動せずログだけ出力
-    log_dir: 実行ログCSVを書き出すフォルダ（未指定なら report.csv と同じ場所）
+    互換用：CSVから読み込んで適用する。
     """
-    # 1) CSVスキーマ確認
     with open(csv_path, encoding="utf-8") as fp:
         r = csv.DictReader(fp)
-        fields = set(r.fieldnames or [])
-        if not REQUIRED_FIELDS.issubset(fields):
-            raise ValueError("report.csv の列が新仕様と異なります。scanを再実行してください。")
-
-    # 2) 候補の事前スキャン（件数把握）
-    def collect_targets(kind: str):
-        items = []
-        with open(csv_path, encoding="utf-8") as fp:
-            r = csv.DictReader(fp)
-            for row in r:
-                t = row.get("type"); d = row.get("domain")
-                if kind == "visual":
-                    if t == "visual" and d == "group":
-                        keep = (row.get("keep") or "").strip()
-                        cand = (row.get("candidate") or "").strip()
-                        if cand and cand != keep:
-                            items.append(row)
-                elif kind == "blur":
-                    if t == "blur_single" and d == "single":
-                        cand = (row.get("candidate") or "").strip()
-                        if cand:
-                            items.append(row)
-        return items
-
-    kinds = []
-    if only in (None, "visual"): kinds.append("visual")
-    if only in (None, "blur"): kinds.append("blur")
-
-    targets_by_kind = {k: collect_targets(k) for k in kinds}
-    total_targets = sum(len(v) for v in targets_by_kind.values())
-
-    # 3) 確認
-    if confirm:
-        print(f"[PLAN] target files: {total_targets} (visual={len(targets_by_kind.get('visual',[]))}, blur={len(targets_by_kind.get('blur',[]))})")
-        ans = input("Proceed? [y/N]: ").strip().lower()
-        if ans not in ("y","yes"):
-            print("[CANCELLED] no action taken.")
-            return
-
-    # 4) ログ準備
-    writer, fp_log, log_path = _open_log(csv_path, log_dir)
-    mode = "dry-run" if dry_run else "apply"
-    prot_list = [_norm(p) for p in _parse_list(protect)]
-    moved = {"visual":0, "blur":0}
-    missing = {"visual":0, "blur":0}
-    errors = {"visual":0, "blur":0}
-    protected = {"visual":0, "blur":0}
-    skipped_max = {"visual":0, "blur":0}
-
-    def process(kind: str):
-        nonlocal moved, missing, errors, protected, skipped_max
-        count_moved = 0
-        # 再読み込みして順に処理
-        with open(csv_path, encoding="utf-8") as fp:
-            r = csv.DictReader(fp)
-            for row in r:
-                if kind == "visual":
-                    if not (row.get("type")=="visual" and row.get("domain")=="group"):
-                        continue
-                    keep = (row.get("keep") or "").strip()
-                    cand = (row.get("candidate") or "").strip()
-                    if not cand or cand == keep:
-                        continue
-                else:  # blur
-                    if not (row.get("type")=="blur_single" and row.get("domain")=="single"):
-                        continue
-                    cand = (row.get("candidate") or "").strip()
-                    keep = ""
-
-                # 上限チェック
-                if max_move is not None and (moved["visual"] + moved["blur"]) >= max_move:
-                    skipped_max[kind] += 1
-                    writer.writerow([datetime.datetime.now().isoformat(), mode, "skipped_max",
-                                     row.get("type"), row.get("domain"), row.get("group"),
-                                     keep, cand, row.get("relation"), f"max_move={max_move}"])
-                    continue
-
-                # 存在チェック
-                if not _exists(cand):
-                    missing[kind] += 1
-                    writer.writerow([datetime.datetime.now().isoformat(), mode, "missing",
-                                     row.get("type"), row.get("domain"), row.get("group"),
-                                     keep, cand, row.get("relation"), "not found"])
-                    continue
-
-                # 保護チェック
-                if prot_list and _in_protect(cand, prot_list):
-                    protected[kind] += 1
-                    writer.writerow([datetime.datetime.now().isoformat(), mode, "protected",
-                                     row.get("type"), row.get("domain"), row.get("group"),
-                                     keep, cand, row.get("relation"), "protected path"])
-                    continue
-
-                # 実行
-                try:
-                    if dry_run:
-                        writer.writerow([datetime.datetime.now().isoformat(), mode, "would_move",
-                                         row.get("type"), row.get("domain"), row.get("group"),
-                                         keep, cand, row.get("relation"), "dry-run"])
-                    else:
-                        to_trash(cand)
-                        writer.writerow([datetime.datetime.now().isoformat(), mode, "moved",
-                                         row.get("type"), row.get("domain"), row.get("group"),
-                                         keep, cand, row.get("relation"), ""])
-                        moved[kind] += 1
-                except Exception as e:
-                    errors[kind] += 1
-                    writer.writerow([datetime.datetime.now().isoformat(), mode, "error",
-                                     row.get("type"), row.get("domain"), row.get("group"),
-                                     keep, cand, row.get("relation"), str(e)])
-
-    # 5) 実行
-    for k in kinds:
-        process(k)
-
-    fp_log.close()
-    print(f"[LOG] written: {log_path}")
-    for k in kinds:
-        print(f"[{k}] moved={moved[k]}, missing={missing[k]}, protected={protected[k]}, errors={errors[k]}, skipped_by_max={skipped_max[k]}")
+        # フィールドが足りない行はスキップ
+        rows = [row for row in r if set(FIELDS).issubset(set(r.fieldnames or []))]
+    return apply_from_rows(
+        rows,
+        only=only,
+        protect=protect,
+        max_move=max_move,
+        dry_run=dry_run,
+        log_dir=log_dir,
+    )

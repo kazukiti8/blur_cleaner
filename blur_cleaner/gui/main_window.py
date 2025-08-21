@@ -1,23 +1,24 @@
 from __future__ import annotations
-import os, sys, json, threading, queue, subprocess
+import os, sys, threading, queue, subprocess
 from typing import Dict, List, Optional, Tuple, Any
 
 import tkinter as tk
 import tkinter.ttk as ttk
 from tkinter import filedialog, messagebox
 
-from ..scan import scan, ScanRow
+from ..scan import scan
 from ..apply import apply_from_rows
 from .table_views import BlurTable, VisualTable
 from .preview_panel import PreviewPanel
 
 from ..fast_scan import compute_phash_parallel, build_similar_pairs_bktree
+from ..cache_db import open_cache_at, CacheDB
 
 __all__ = ["main"]
 
 PHASH_DIST  = 6
-DO_SIMILAR  = False   # 既存scanの類似は使わず、自前で行う
-AUTO_PCT    = 10      # ブレ下位10%を閾値に固定
+DO_SIMILAR  = False
+AUTO_PCT    = 10
 
 
 class BlurCleanerApp(tk.Tk):
@@ -40,7 +41,9 @@ class BlurCleanerApp(tk.Tk):
         self._task_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self._all_rows: List[Dict[str, str]] = []
         self._cancel_ev: Optional[threading.Event] = None
-        self._alive = True  # pollループ生存フラグ
+        self._alive = True
+
+        # 以前はここに self._cache を持っていたが、スレッド越境防止のため廃止
 
         self._build_ui()
         self._poll_queue()
@@ -50,7 +53,6 @@ class BlurCleanerApp(tk.Tk):
         paned_main = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         paned_main.pack(fill=tk.BOTH, expand=True)
 
-        # サイドバー
         sidebar = tk.Frame(paned_main, bg="#ffffff", width=360)
         paned_main.add(sidebar, weight=0)
 
@@ -65,7 +67,6 @@ class BlurCleanerApp(tk.Tk):
         ttk.Entry(row, textvariable=self.var_target).pack(fill=tk.X, pady=3)
         ttk.Button(row, text="参照…", command=self._browse_target).pack(anchor="e")
 
-        # ボタン群
         btns = tk.Frame(sidebar, bg="#ffffff")
         btns.pack(fill=tk.X, padx=12, pady=(12, 12))
         self.btn_scan = ttk.Button(btns, text="▶ スキャン開始", command=self._scan_clicked)
@@ -76,7 +77,6 @@ class BlurCleanerApp(tk.Tk):
         self.btn_cancel.pack(fill=tk.X, pady=(8, 0))
         self.btn_apply.pack(fill=tk.X, pady=(8, 0))
 
-        # 右側
         right_container = tk.Frame(paned_main, bg="#ffffff")
         paned_main.add(right_container, weight=1)
 
@@ -105,7 +105,6 @@ class BlurCleanerApp(tk.Tk):
         self.lbl_info.pack(anchor="w")
         self.pb.pack(fill=tk.X, pady=(6, 0))
 
-        # プレビュー
         self.preview = PreviewPanel(right, w_single=880, h_single=660, w_pair=760, h_pair=560)
         self.preview.pack(fill=tk.BOTH, expand=True)
 
@@ -121,13 +120,11 @@ class BlurCleanerApp(tk.Tk):
                 pass
         self.after(80, _set_initial_sash)
 
-    # ---- sidebar ----
     def _browse_target(self):
         d = filedialog.askdirectory(title="対象フォルダを選択")
         if d:
             self.var_target.set(d)
 
-    # ---- Scan / Apply / Cancel ----
     def _scan_clicked(self):
         target = self.var_target.get().strip()
         if not target or not os.path.isdir(target):
@@ -157,14 +154,23 @@ class BlurCleanerApp(tk.Tk):
 
     # ---- Jobs ----
     def _scan_job(self):
+        cache: Optional[CacheDB] = None
         try:
             target = self.var_target.get().strip()
+
+            # ★ DBはワーカースレッド内で開く（同スレッド内で使用・クローズ）
+            try:
+                cache = open_cache_at(target)
+                cache.begin_session()
+            except Exception as e:
+                self._safe_put(("msg", f"［警告］キャッシュ無効: {e}"))
+                cache = None
 
             def _prog(phase: str, cur: int, tot: int):
                 self._safe_put(("progress", {"phase": phase, "current": cur, "total": tot}))
 
-            # Phase A: ブレのみ（全件）
-            rows_passA, stats = scan(
+            # Phase A: ブレ（全件）
+            rows_passA, _ = scan(
                 target_dir=target, report_csv=None, dbpath=None,
                 blur_threshold=1e9, do_similar=DO_SIMILAR, phash_distance=PHASH_DIST,
                 include_exts=None, exclude_substr=None, collect_stats=True,
@@ -173,7 +179,6 @@ class BlurCleanerApp(tk.Tk):
             if self._cancel_ev and self._cancel_ev.is_set():
                 self._safe_put(("msg", "［中止］ブレ計測を中断しました")); return
 
-            # 自動しきい値（下位10%固定）
             vals = [r.blur_value for r in rows_passA]
             thr = self._percentile(vals, AUTO_PCT) if vals else 0.0
             self._safe_put(("msg", f"［自動］ブレしきい値 = {thr:.1f}（下位{AUTO_PCT}%）"))
@@ -183,26 +188,62 @@ class BlurCleanerApp(tk.Tk):
                 "candidate": r.path, "relation": f"lap_var={r.blur_value:.6f};",
             } for r in rows_passA]
 
-            # Phase B: pHashはシャープのみ
+            # DBへ blur 反映
+            if cache:
+                blur_rows = []
+                for r in rows_passA:
+                    try:
+                        st = os.stat(r.path)
+                        blur_rows.append((r.path, int(st.st_mtime), int(st.st_size), float(r.blur_value)))
+                    except Exception:
+                        pass
+                cache.upsert_blur(blur_rows)
+
             sharp_paths = [r.path for r in rows_passA if r.blur_value >= thr]
             self._safe_put(("msg", f"［情報］pHash対象 {len(sharp_paths)} 件（全{len(rows_passA)}件中）"))
             if self._cancel_ev and self._cancel_ev.is_set():
                 self._all_rows = rows_blur
                 self._safe_put(("table_blur", rows_blur))
                 self._safe_put(("msg", "［中止］pHash計算を開始せず終了"))
+                if cache: cache.finalize_session([r.path for r in rows_passA])
                 return
 
+            # 差分判定
+            path_metas: List[Tuple[str,int,int]] = []
+            for p in sharp_paths:
+                try:
+                    st = os.stat(p); path_metas.append((p, int(st.st_mtime), int(st.st_size)))
+                except Exception:
+                    pass
+
+            need_compute, cached_map = (cache.get_cached_phash(path_metas) if cache
+                                        else ([p for p,_,_ in path_metas], {}))
+
+            # pHash計算（差分のみ）
             def _cb_hash(done, total):
                 self._safe_put(("progress", {"phase": "hash", "current": done, "total": total}))
-            path_to_hash = compute_phash_parallel(
-                sharp_paths, max_workers=None, progress_cb=_cb_hash, cancel_ev=self._cancel_ev
-            )
-            if self._cancel_ev and self._cancel_ev.is_set():
-                self._all_rows = rows_blur
-                self._safe_put(("table_blur", rows_blur))
-                self._safe_put(("msg", "［中止］pHash計算を中断しました"))
-                return
+            path_to_hash: Dict[str,int] = dict(cached_map)
+            if need_compute:
+                computed = compute_phash_parallel(
+                    need_compute, max_workers=None, progress_cb=_cb_hash, cancel_ev=self._cancel_ev
+                )
+                if self._cancel_ev and self._cancel_ev.is_set():
+                    self._all_rows = rows_blur
+                    self._safe_put(("table_blur", rows_blur))
+                    self._safe_put(("msg", "［中止］pHash計算を中断しました"))
+                    if cache: cache.finalize_session([r.path for r in rows_passA])
+                    return
+                path_to_hash.update(computed)
 
+                if cache and computed:
+                    meta_map = {p:(m,s) for p,m,s in path_metas}
+                    rows = []
+                    for p, h in computed.items():
+                        if p in meta_map:
+                            m, s = meta_map[p]; rows.append((p, m, s, h))
+                    cache.upsert_phash(rows)
+
+            # 類似探索
             def _cb_bk(done, total):
                 self._safe_put(("progress", {"phase": "類似判定", "current": done, "total": total}))
             pairs = build_similar_pairs_bktree(
@@ -212,6 +253,7 @@ class BlurCleanerApp(tk.Tk):
                 self._all_rows = rows_blur
                 self._safe_put(("table_blur", rows_blur))
                 self._safe_put(("msg", "［中止］類似探索を中断しました"))
+                if cache: cache.finalize_session([r.path for r in rows_passA])
                 return
 
             blur_map = {r.path: r.blur_value for r in rows_passA}
@@ -228,9 +270,20 @@ class BlurCleanerApp(tk.Tk):
             self._safe_put(("table_blur", rows_blur))
             self._safe_put(("table_vis", rows_vis))
             self._safe_put(("msg", f"［完了］スキャン: ブレ {len(rows_blur)} 件 / 類似 {len(rows_vis)} 件"))
+
+            # セッション終了（削除掃除）
+            if cache:
+                cache.finalize_session([r.path for r in rows_passA], purge_deleted=True)
+
         except Exception as e:
             self._safe_put(("error", f"スキャン失敗: {e}"))
         finally:
+            # ★ DBはワーカー内でクローズ
+            try:
+                if cache:
+                    cache.close()
+            except Exception:
+                pass
             self._safe_put(("idle", None))
 
     def _apply_job(self, mode: str, selected_paths: set[str]):
@@ -260,7 +313,7 @@ class BlurCleanerApp(tk.Tk):
         finally:
             self._safe_put(("idle", None))
 
-    # ---- Queue反映 ----
+    # ---- Queue/選択/ユーティリティ（省略なし） ----
     def _poll_queue(self):
         if not self._alive:
             return
@@ -296,15 +349,12 @@ class BlurCleanerApp(tk.Tk):
             pass
         self.after(80, self._poll_queue)
 
-    # ---- 選択→プレビュー ----
     def _on_select_blur(self, path: Optional[str]):
-        # 空振りガード（テーブルリロード直後など）
         if not path or not os.path.isfile(path):
             self.preview.clear(); return
         self.preview.show_single(path)
 
     def _on_select_visual(self, keep: Optional[str], cand: Optional[str]):
-        # 実在チェック
         k = keep if (keep and os.path.isfile(keep)) else None
         c = cand if (cand and os.path.isfile(cand)) else None
         if k and c: self.preview.show_pair(k, c)
@@ -312,7 +362,6 @@ class BlurCleanerApp(tk.Tk):
         elif c: self.preview.show_single(c)
         else: self.preview.clear()
 
-    # ---- Util ----
     @staticmethod
     def _percentile(values: List[float], p: int) -> float:
         if not values: return 0.0
@@ -321,7 +370,7 @@ class BlurCleanerApp(tk.Tk):
         return float(v[idx])
 
     def _open_in_explorer(self, path: str):
-        if not path or not os.path.exists(path): 
+        if not path or not os.path.exists(path):
             return
         try:
             if sys.platform.startswith("win"):
@@ -350,7 +399,6 @@ class BlurCleanerApp(tk.Tk):
         self.update_idletasks()
 
     def _safe_put(self, item: Tuple[str, Any]):
-        # キューあふれ時は最古を捨てる
         try:
             self._task_q.put_nowait(item)
         except queue.Full:
@@ -364,15 +412,12 @@ class BlurCleanerApp(tk.Tk):
                 pass
 
     def _on_close(self):
-        # 処理中なら中止要求
         if self._cancel_ev and not self._cancel_ev.is_set():
             self._cancel_ev.set()
-        # プレビュー停止
         try:
             self.preview.shutdown()
         except Exception:
             pass
-        # poll停止
         self._alive = False
         self.destroy()
 

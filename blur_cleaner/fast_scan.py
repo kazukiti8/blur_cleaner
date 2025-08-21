@@ -1,39 +1,142 @@
-# blur_cleaner/fast_scan.py  — 安定化版（バッチ処理＋同時実行制限＋軽量バケツ探索）
 from __future__ import annotations
-import os, math, gc, threading, concurrent.futures as futures
+import os, gc, threading, concurrent.futures as futures
 from typing import Callable, Dict, Iterable, List, Tuple, Optional
 from PIL import Image, ImageOps
 import numpy as np
 
+# --- 画像拡張子 ---
+DEFAULT_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif")
+
+# HEIF対応（入っていれば自動で有効）
 try:
-    import pillow_heif  # HEIFが入っていれば有効化
+    import pillow_heif  # type: ignore
     pillow_heif.register_heif_opener()
 except Exception:
     pass
 
-# ---------- 基本ユーティリ ----------
-def _safe_open_thumb(path: str, max_side: int = 256) -> Optional[Image.Image]:
-    """Pillowで安全に開いて縮小。戻り値はクローズ不要（copy済み）。失敗は None。"""
+# ---------------------------
+#    画像列挙
+# ---------------------------
+def list_image_files(root: str, exts: Iterable[str] = DEFAULT_EXTS) -> List[str]:
+    exts_l = tuple(e.lower() for e in exts)
+    out: List[str] = []
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            if fn.lower().endswith(exts_l):
+                out.append(os.path.join(dirpath, fn))
+    return out
+
+# ---------------------------
+#    ブレ（ラプラシアン分散）
+# ---------------------------
+def _safe_open_gray_thumb(path: str, max_side: int = 640) -> Optional[Image.Image]:
     try:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im)
-            im = im.convert("L")  # グレースケール化（pHash用途）
+            im = im.convert("L")  # グレースケール
             im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
             return im.copy()
     except Exception:
         return None
 
-def _phash(im: Image.Image) -> int:
-    """pHash（64bit）。画像は既にグレースケール＆縮小前提。"""
-    # 32x32にリサイズ→DCT→上位左8x8の低周波成分→中央値でビット化
-    im_small = im.resize((32, 32), Image.Resampling.LANCZOS)
+def _laplacian_variance(gray_img: Image.Image) -> float:
+    # Laplacian（3x3近似）→ 分散
+    a = np.asarray(gray_img, dtype=np.float32)
+    # 0  1  0
+    # 1 -4  1
+    # 0  1  0
+    k = np.array([[0,1,0],[1,-4,1],[0,1,0]], dtype=np.float32)
+    # パディングして畳み込み（簡易実装）
+    pad = np.pad(a, ((1,1),(1,1)), mode="reflect")
+    # 畳み込み
+    conv = (
+        k[0,0]*pad[:-2, :-2] + k[0,1]*pad[:-2,1:-1] + k[0,2]*pad[:-2,2:] +
+        k[1,0]*pad[1:-1, :-2] + k[1,1]*pad[1:-1,1:-1]+ k[1,2]*pad[1:-1,2:] +
+        k[2,0]*pad[2:,  :-2] + k[2,1]*pad[2:, 1:-1] + k[2,2]*pad[2:,  2:]
+    )
+    v = float(np.var(conv))
+    return v
+
+def compute_blur_parallel(
+    paths: List[str],
+    max_workers: Optional[int] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    cancel_ev: Optional[threading.Event] = None,
+    max_inflight: int = 64,
+    batch_size: int = 512,
+) -> Dict[str, float]:
+    """
+    画像パス一覧 → {path: laplacian_variance} を返す。
+    - 未対応/壊れた画像は除外（戻り値に含めない）
+    - 同時デコード数は max_inflight で制限
+    - バッチごとにGC＆進捗更新
+    """
+    total = len(paths)
+    if total == 0:
+        return {}
+
+    if max_workers is None:
+        cw = os.cpu_count() or 4
+        max_workers = max(1, min(8, cw // 2))  # 控えめ
+
+    def _job(p: str) -> Tuple[str, Optional[float]]:
+        if cancel_ev and cancel_ev.is_set():
+            return (p, None)
+        im = _safe_open_gray_thumb(p)
+        if im is None:
+            return (p, None)
+        try:
+            v = _laplacian_variance(im)
+            return (p, v)
+        except Exception:
+            return (p, None)
+        finally:
+            del im
+
+    out: Dict[str, float] = {}
+    done = 0
+    sem = threading.Semaphore(max_inflight)
+
+    def _wrap(p: str):
+        with sem:
+            return _job(p)
+
+    with futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for i in range(0, total, batch_size):
+            if cancel_ev and cancel_ev.is_set():
+                break
+            chunk = paths[i:i+batch_size]
+            fs = [ex.submit(_wrap, p) for p in chunk]
+            for f in futures.as_completed(fs):
+                p, v = f.result()
+                if v is not None:
+                    out[p] = v
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total)
+            gc.collect()
+
+    return out
+
+# ---------------------------
+#    pHash（既存：少し整理）
+# ---------------------------
+def _safe_open_thumb_for_hash(path: str, max_side: int = 256) -> Optional[Image.Image]:
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im)
+            im = im.convert("L")
+            im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            return im.copy()
+    except Exception:
+        return None
+
+def _phash64(gray_img: Image.Image) -> int:
+    im_small = gray_img.resize((32, 32), Image.Resampling.LANCZOS)
     arr = np.asarray(im_small, dtype=np.float32)
-    # 雑なDCT: FFT経由の近似でも十分
-    dct = np.fft.fft2(arr)
-    dct = np.abs(dct[:8, :8])
+    dct = np.abs(np.fft.fft2(arr))[:8, :8]
     med = np.median(dct)
     bits = (dct > med).astype(np.uint8).flatten()
-    # 64bitへ
     v = 0
     for b in bits:
         v = (v << 1) | int(b)
@@ -42,7 +145,6 @@ def _phash(im: Image.Image) -> int:
 def _hamming(a: int, b: int) -> int:
     return int((a ^ b).bit_count())
 
-# ---------- pHash計算（安定化） ----------
 def compute_phash_parallel(
     paths: List[str],
     max_workers: Optional[int] = None,
@@ -51,38 +153,30 @@ def compute_phash_parallel(
     max_inflight: int = 64,
     batch_size: int = 512,
 ) -> Dict[str, int]:
-    """
-    画像パス一覧 → {path: phash(64bit)} を返す。
-    - 同時デコードは max_inflight で制限
-    - バッチごとにGC＆進捗報告
-    """
     total = len(paths)
     if total == 0:
         return {}
+
     if max_workers is None:
         cw = os.cpu_count() or 4
-        max_workers = max(1, min(8, cw // 2))  # 控えめ
+        max_workers = max(1, min(8, cw // 2))
 
-    # 実際に投げる仕事
     def _job(p: str) -> Tuple[str, Optional[int]]:
         if cancel_ev and cancel_ev.is_set():
             return (p, None)
-        im = _safe_open_thumb(p)
+        im = _safe_open_thumb_for_hash(p)
         if im is None:
             return (p, None)
         try:
-            h = _phash(im)
+            h = _phash64(im)
             return (p, h)
         except Exception:
             return (p, None)
         finally:
-            # 明示解放
             del im
 
     out: Dict[str, int] = {}
     done = 0
-
-    # セマフォで同時フライ数を制限
     sem = threading.Semaphore(max_inflight)
 
     def _wrap(p: str):
@@ -90,11 +184,10 @@ def compute_phash_parallel(
             return _job(p)
 
     with futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        # バッチに分割して投入
         for i in range(0, total, batch_size):
             if cancel_ev and cancel_ev.is_set():
                 break
-            chunk = paths[i:i + batch_size]
+            chunk = paths[i:i+batch_size]
             fs = [ex.submit(_wrap, p) for p in chunk]
             for f in futures.as_completed(fs):
                 p, h = f.result()
@@ -103,12 +196,12 @@ def compute_phash_parallel(
                 done += 1
                 if progress_cb:
                     progress_cb(done, total)
-            # バッチ終わりでクリーンアップ
             gc.collect()
-
     return out
 
-# ---------- 類似探索（バケツ分割） ----------
+# ---------------------------
+#    類似探索（バケツ分割）
+# ---------------------------
 def build_similar_pairs_bktree(
     path_to_hash: Dict[str, int],
     radius: int = 6,
@@ -116,32 +209,26 @@ def build_similar_pairs_bktree(
     cancel_ev: Optional[threading.Event] = None,
     bucket_bits: int = 12,
 ) -> List[Tuple[str, str, int]]:
-    """
-    上位 bucket_bits でバケツに分け、同バケツ内だけハミング距離を計算。
-    radius 以下のペアを返す。
-    """
     items = list(path_to_hash.items())
     total = len(items)
     if total == 0:
         return []
 
-    # バケツ化
     buckets: Dict[int, List[Tuple[str, int]]] = {}
     mask = (1 << bucket_bits) - 1
     for p, h in items:
         key = (h >> (64 - bucket_bits)) & mask
         buckets.setdefault(key, []).append((p, h))
 
-    # 各バケツ内で距離計算（O(n^2)だがnは小さくなる想定）
     pairs: List[Tuple[str, str, int]] = []
     processed = 0
-    for key, arr in buckets.items():
+    for _, arr in buckets.items():
         n = len(arr)
         for i in range(n):
             if cancel_ev and cancel_ev.is_set():
                 return pairs
             p1, h1 = arr[i]
-            for j in range(i + 1, n):
+            for j in range(i+1, n):
                 p2, h2 = arr[j]
                 d = _hamming(h1, h2)
                 if d <= radius:
@@ -149,7 +236,5 @@ def build_similar_pairs_bktree(
             processed += 1
             if progress_cb:
                 progress_cb(processed, total)
-        # バケツごとにGC
         gc.collect()
-
     return pairs

@@ -1,12 +1,11 @@
 from __future__ import annotations
 import os
-from typing import Callable, Dict, List, Optional, Tuple, Set
-
+import math
 import tkinter as tk
 import tkinter.ttk as ttk
+from typing import Callable, Dict, List, Optional, Tuple, Any
 
-
-# ---- 共通ユーティリティ ----
+# --------- 共通ユーティリティ ----------
 def _fmt_size(bytes_: int) -> str:
     try:
         b = int(bytes_)
@@ -24,154 +23,87 @@ def _fmt_size(bytes_: int) -> str:
     return f"{gb:.2f} GB"
 
 
-# =========================
-# ブレ結果テーブル（昇順）＋ページング
-# =========================
+# --------- ブレ結果テーブル ----------
 class BlurTable(tk.Frame):
-    def __init__(
-        self,
-        master,
-        on_select: Callable[[Optional[str]], None],
-        on_open: Optional[Callable[[str], None]] = None,
-        page_size: int = 1000,
-    ):
+    """
+    ブレ結果（昇順表示）
+      列: [✓, ファイル名, サイズ, スコア]
+      ・チェックは1列目クリックでトグル
+      ・ダブルクリックでファイルをエクスプローラ選択表示（on_open）
+      ・ページング対応
+    """
+    def __init__(self, master,
+                 on_select: Callable[[Optional[str]], None],
+                 on_open: Callable[[str], None],
+                 page_size: int = 1000):
         super().__init__(master, bg="#ffffff")
-
         self._on_select = on_select
         self._on_open = on_open
-        self._page_size = max(100, int(page_size))
-        self._rows: List[Dict[str, str]] = []
-        self._page = 0
+        self._page_size = page_size
 
-        # ページングバー
-        bar = tk.Frame(self, bg="#ffffff")
-        bar.pack(fill=tk.X, pady=(0, 4))
-        self._lbl_pg = tk.Label(bar, text="ページ 0/0", bg="#ffffff")
-        self._btn_prev = ttk.Button(bar, text="◀ 前へ", width=8, command=self.prev_page)
-        self._btn_next = ttk.Button(bar, text="次へ ▶", width=8, command=self.next_page)
-        self._btn_prev.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_next.pack(side=tk.LEFT)
-        self._lbl_pg.pack(side=tk.RIGHT)
+        top = tk.Frame(self, bg="#ffffff")
+        top.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(top, text="ブレ結果（昇順）", bg="#ffffff").pack(side=tk.LEFT)
+        self.lbl_page = tk.Label(top, text="ページ", bg="#ffffff")
+        self.lbl_page.pack(side=tk.RIGHT)
+        ttk.Button(top, text="次へ", command=self._next).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(top, text="前へ", command=self._prev).pack(side=tk.RIGHT, padx=4)
 
-        # Treeview
         cols = ("sel", "name", "size", "score")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=18)
-        self.tree.heading("sel", text="✓")
-        self.tree.heading("name", text="ファイル名")
-        self.tree.heading("size", text="サイズ")
-        self.tree.heading("score", text="スコア（ブレ値）")
+        tv = ttk.Treeview(self, columns=cols, show="headings", height=18)
+        self.tree = tv
+        tv.heading("sel", text="✓")
+        tv.heading("name", text="ファイル名")
+        tv.heading("size", text="サイズ")
+        tv.heading("score", text="スコア（ブレ値）")
 
-        self.tree.column("sel", width=60, anchor="center", stretch=False)
-        self.tree.column("name", width=520, anchor="w", stretch=True)
-        self.tree.column("size", width=120, anchor="e", stretch=False)
-        self.tree.column("score", width=140, anchor="e", stretch=False)
+        # 列幅固定
+        tv.column("sel", width=36, anchor="center", stretch=False)
+        tv.column("name", width=460, stretch=False)
+        tv.column("size", width=100, anchor="e", stretch=False)
+        tv.column("score", width=120, anchor="e", stretch=False)
 
-        sb_y = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        sb_x = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscroll=sb_y.set, xscroll=sb_x.set)
+        tv.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=tv.yview)
+        tv.configure(yscroll=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        sb_y.pack(side=tk.RIGHT, fill=tk.Y)
-        sb_x.pack(fill=tk.X)
+        tv.bind("<<TreeviewSelect>>", self._on_sel)
+        tv.bind("<ButtonRelease-1>", self._toggle_check)
+        tv.bind("<Double-1>", self._on_open_file)  # ★ 追加：ダブルクリックで開く
 
-        # 行→パス、チェック状態
-        self._path: Dict[str, str] = {}
+        self._rows: List[Dict[str, Any]] = []
+        self._start = 0
         self._checked: Dict[str, bool] = {}
+        self._iid_path: Dict[str, str] = {}
 
-        # イベント
-        self.tree.bind("<Button-1>", self._on_click_checkbox)      # チェック切替
-        self.tree.bind("<ButtonRelease-1>", self._on_any_click)    # ★行クリックでも強制選択→プレビュー
-        self.tree.bind("<<TreeviewSelect>>", self._on_select_event)
-        if on_open:
-            self.tree.bind("<Double-1>", self._on_double_click)
-            
-        print("[DBG] BlurTable binds:",
-      "Release-1=" + ("ON" if self.tree.bind("<ButtonRelease-1>") else "OFF"),
-      "Select=" + ("ON" if self.tree.bind("<<TreeviewSelect>>") else "OFF"))
-
-
-
-    # ---- 内部ヘルパ ----
-    def _on_any_click(self, e: tk.Event):
-        """どのセルをクリックしても選択を更新→プレビュー連動"""
-        iid = self.tree.identify_row(e.y)
-        if not iid:
+    # ページング
+    def _prev(self):
+        if self._start == 0:
             return
-        # 既に選択されていない場合のみ更新（不要な多重発火を抑制）
-        sel = self.tree.selection()
-        if not sel or sel[0] != iid:
-            self.tree.selection_set(iid)
-            self.tree.see(iid)
-            self._on_select_event(None)
+        self._start = max(0, self._start - self._page_size)
+        self._redraw()
 
-    def _on_click_checkbox(self, e: tk.Event):
-        # チェック列クリック時も選択させてプレビュー更新
-        if self.tree.identify_region(e.x, e.y) != "cell":
+    def _next(self):
+        if self._start + self._page_size >= len(self._rows):
             return
-        col = self.tree.identify_column(e.x)
-        iid = self.tree.identify_row(e.y)
-        if not iid:
-            return
+        self._start = self._start + self._page_size
+        self._redraw()
 
-        if col == "#1":  # チェックボックス列
-            cur = self._checked.get(iid, False)
-            self._checked[iid] = not cur
-            self.tree.set(iid, "sel", "☑" if not cur else "☐")
-            self.tree.selection_set(iid)
-            self.tree.see(iid)
-            self._on_select_event(None)
-
-    def _on_select_event(self, e: Optional[tk.Event]):
-        sel = self.tree.selection()
-        path = self._path.get(sel[0]) if sel else None
-        self._on_select(path)
-
-    def _on_double_click(self, e: tk.Event):
-        if not self._on_open:
-            return
-        iid = self.tree.identify_row(e.y)
-        if not iid:
-            return
-        p = self._path.get(iid, "")
-        if p:
-            self._on_open(p)
-
-    def _lap_of(self, r: Dict[str, str]) -> Optional[float]:
-        rel = r.get("relation") or ""
-        try:
-            if "lap_var=" in rel:
-                return float(rel.split("lap_var=")[1].split(";")[0].strip())
-            for part in rel.split(";"):
-                part = part.strip()
-                if part.startswith("lap_cand="):
-                    return float(part.split("=", 1)[1])
-        except Exception:
-            pass
-        return None
-
-    # ---- API ----
-    def load(self, rows: List[Dict[str, str]]):
-        # ブレ値の小さい順（昇順）
-        self._rows = sorted(rows, key=lambda r: (self._lap_of(r) if self._lap_of(r) is not None else 1e18))
-        self._page = 0
-        self._render_page()
-
-    def _render_page(self):
-        for iid in self.tree.get_children(""):
-            self.tree.delete(iid)
-        self._path.clear()
+    def load(self, rows: List[Dict[str, Any]]):
+        self._rows = rows or []
+        self._start = 0
         self._checked.clear()
+        self._iid_path.clear()
+        self._redraw()
 
-        total = len(self._rows)
-        pages = max(1, (total + self._page_size - 1) // self._page_size)
-        self._page = max(0, min(self._page, pages - 1))
-        self._lbl_pg.config(text=f"ページ {self._page + 1}/{pages}")
-
-        start = self._page * self._page_size
-        end = min(total, start + self._page_size)
-
-        first_iid = None
-        for r in self._rows[start:end]:
+    def _redraw(self):
+        tv = self.tree
+        for iid in tv.get_children(""):
+            tv.delete(iid)
+        end = min(len(self._rows), self._start + self._page_size)
+        view = self._rows[self._start:end]
+        for r in view:
             p = r.get("candidate") or ""
             name = os.path.basename(p)
             try:
@@ -179,267 +111,260 @@ class BlurTable(tk.Frame):
             except Exception:
                 size_b = 0
             size_s = _fmt_size(size_b)
-            lv = self._lap_of(r)
-            score = f"{lv:.1f}" if lv is not None else "-"
-            iid = self.tree.insert("", tk.END, values=("☐", name, size_s, score))
-            if first_iid is None:
-                first_iid = iid
-            self._path[iid] = p
+            # relationからブレ値
+            score = "-"
+            rel = str(r.get("relation") or "")
+            if "lap_var=" in rel:
+                try:
+                    score = f"{float(rel.split('lap_var=')[1].split(';')[0]):.1f}"
+                except Exception:
+                    pass
+            iid = tv.insert("", tk.END, values=("☐", name, size_s, score))
+            self._iid_path[iid] = p
             self._checked[iid] = False
+        self.lbl_page.config(
+            text=f"ページ {self._start // self._page_size + 1} / {max(1, math.ceil(len(self._rows) / self._page_size))}"
+        )
 
-        if first_iid:
-            self.tree.selection_set(first_iid)
-            self.tree.see(first_iid)
-            # 初回描画時にもプレビューを明示更新
-            self._on_select_event(None)
+    def _on_sel(self, _e=None):
+        sel = self.tree.selection()
+        if not sel:
+            self._on_select(None)
+            return
+        p = self._iid_path.get(sel[0])
+        self._on_select(p)
 
-        self._btn_prev.config(state=(tk.NORMAL if self._page > 0 else tk.DISABLED))
-        self._btn_next.config(state=(tk.NORMAL if self._page < pages - 1 else tk.DISABLED))
+    def _toggle_check(self, e: tk.Event):
+        tv = self.tree
+        if tv.identify("region", e.x, e.y) != "cell":
+            return
+        if tv.identify_column(e.x) != "#1":
+            return
+        iid = tv.identify_row(e.y)
+        if not iid:
+            return
+        cur = self._checked.get(iid, False)
+        self._checked[iid] = not cur
+        tv.set(iid, "sel", "☑" if not cur else "☐")
 
-    def next_page(self):
-        self._page += 1
-        self._render_page()
+    def _on_open_file(self, _e=None):
+        """ダブルクリックで OS のエクスプローラ等で開く"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        p = self._iid_path.get(sel[0])
+        if p:
+            try:
+                self._on_open(p)
+            except Exception:
+                pass
 
-    def prev_page(self):
-        self._page -= 1
-        self._render_page()
+    def selected_candidates(self) -> List[str]:
+        return [p for iid, p in self._iid_path.items() if self._checked.get(iid, False)]
 
-    def selected_candidates(self) -> Set[str]:
-        return {p for iid, p in self._path.items() if self._checked.get(iid, False)}
-
-    def remove_by_paths(self, paths: Set[str]):
-        # 現在ページ内のみ即時削除（次回レンダで整合）
-        to_remove = [iid for iid, p in self._path.items() if p in paths]
+    def remove_by_paths(self, paths: List[str] | set[str]):
+        to_remove = [iid for iid, p in self._iid_path.items() if p in paths]
         for iid in to_remove:
             if self.tree.exists(iid):
                 self.tree.delete(iid)
             self._checked.pop(iid, None)
-            self._path.pop(iid, None)
+            self._iid_path.pop(iid, None)
 
 
-# =========================
-# 類似結果テーブル（一致度%列・列幅少し小さく）＋ページング
-# =========================
+# --------- 類似結果テーブル ----------
 class VisualTable(tk.Frame):
-    def __init__(
-        self,
-        master,
-        on_select: Callable[[Optional[str], Optional[str]], None],
-        on_open_keep: Optional[Callable[[str], None]] = None,
-        on_open_cand: Optional[Callable[[str], None]] = None,
-        page_size: int = 1000,
-    ):
+    """
+    類似結果（保持/候補の✓を個別に持つ）
+      列: [保✓, 保持名, 候✓, 候補名, 一致度]
+      ・1列目 or 3列目クリックでチェックトグル
+      ・ダブルクリックした列に応じて保持/候補を開く
+    """
+    def __init__(self, master,
+                 on_select: Callable[[Optional[str], Optional[str]], None],
+                 on_open_keep: Callable[[str], None],
+                 on_open_cand: Callable[[str], None],
+                 page_size: int = 1000):
         super().__init__(master, bg="#ffffff")
-
         self._on_select = on_select
-        self._on_open_keep = on_open_keep
-        self._on_open_cand = on_open_cand
-        self._page_size = max(100, int(page_size))
-        self._rows: List[Dict[str, str]] = []
-        self._page = 0
+        self._open_keep = on_open_keep
+        self._open_cand = on_open_cand
+        self._page_size = page_size
 
-        # ページングバー
-        bar = tk.Frame(self, bg="#ffffff")
-        bar.pack(fill=tk.X, pady=(0, 4))
-        self._lbl_pg = tk.Label(bar, text="ページ 0/0", bg="#ffffff")
-        self._btn_prev = ttk.Button(bar, text="◀ 前へ", width=8, command=self.prev_page)
-        self._btn_next = ttk.Button(bar, text="次へ ▶", width=8, command=self.next_page)
-        self._btn_prev.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_next.pack(side=tk.LEFT)
-        self._lbl_pg.pack(side=tk.RIGHT)
+        top = tk.Frame(self, bg="#ffffff")
+        top.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(top, text="類似結果（一致度は右端）", bg="#ffffff").pack(side=tk.LEFT)
+        self.lbl_page = tk.Label(top, text="ページ", bg="#ffffff")
+        self.lbl_page.pack(side=tk.RIGHT)
+        ttk.Button(top, text="次へ", command=self._next).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(top, text="前へ", command=self._prev).pack(side=tk.RIGHT, padx=4)
 
-        # Treeview
-        cols = ("keep_sel", "keep_name", "cand_sel", "cand_name", "similarity")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=18)
+        cols = ("kchk", "kname", "cchk", "cname", "dist")
+        tv = ttk.Treeview(self, columns=cols, show="headings", height=18)
+        self.tree = tv
+        tv.heading("kchk", text="保✓")
+        tv.heading("kname", text="保持ファイル")
+        tv.heading("cchk", text="候✓")
+        tv.heading("cname", text="候補ファイル")
+        tv.heading("dist", text="一致度")
 
-        self.tree.heading("keep_sel", text="✓(保持)")
-        self.tree.heading("keep_name", text="保持ファイル名")
-        self.tree.heading("cand_sel", text="✓(候補)")
-        self.tree.heading("cand_name", text="候補ファイル名")
-        self.tree.heading("similarity", text="一致度")
+        # 幅固定（名前はやや小さめ）
+        tv.column("kchk", width=36, anchor="center", stretch=False)
+        tv.column("kname", width=260, stretch=False)
+        tv.column("cchk", width=36, anchor="center", stretch=False)
+        tv.column("cname", width=260, stretch=False)
+        tv.column("dist", width=80, anchor="e", stretch=False)
 
-        self.tree.column("keep_sel", width=70, anchor="center", stretch=False)
-        self.tree.column("keep_name", width=300, anchor="w", stretch=True)  # 少し狭め
-        self.tree.column("cand_sel", width=70, anchor="center", stretch=False)
-        self.tree.column("cand_name", width=300, anchor="w", stretch=True)  # 少し狭め
-        self.tree.column("similarity", width=100, anchor="e", stretch=False)
+        tv.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=tv.yview)
+        tv.configure(yscroll=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        sb_y = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        sb_x = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscroll=sb_y.set, xscroll=sb_x.set)
+        tv.bind("<<TreeviewSelect>>", self._on_sel)
+        tv.bind("<ButtonRelease-1>", self._toggle_check)
+        tv.bind("<Double-1>", self._on_open_file)
 
-        self.tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        sb_y.pack(side=tk.RIGHT, fill=tk.Y)
-        sb_x.pack(fill=tk.X)
-
-        # 行データ保持
-        self._keep: Dict[str, str] = {}
-        self._cand: Dict[str, str] = {}
+        self._rows: List[Dict[str, Any]] = []
+        self._start = 0
         self._kchk: Dict[str, bool] = {}
         self._cchk: Dict[str, bool] = {}
-        self._dist: Dict[str, int] = {}
+        self._iid_keep: Dict[str, str] = {}
+        self._iid_cand: Dict[str, str] = {}
 
-        # イベント
-        self.tree.bind("<Button-1>", self._on_click_checkbox)
-        self.tree.bind("<ButtonRelease-1>", self._on_any_click)  # ★ 行クリックで選択更新
-        self.tree.bind("<<TreeviewSelect>>", self._on_select_event)
-        self.tree.bind("<Double-1>", self._on_double_click)
-
-        print("[DBG] BlurTable binds:",
-      "Release-1=" + ("ON" if self.tree.bind("<ButtonRelease-1>") else "OFF"),
-      "Select=" + ("ON" if self.tree.bind("<<TreeviewSelect>>") else "OFF"))
-
-
-    # ---- 内部ヘルパ ----
-    def _on_any_click(self, e: tk.Event):
-        iid = self.tree.identify_row(e.y)
-        if not iid:
+    # ページング
+    def _prev(self):
+        if self._start == 0:
             return
-        sel = self.tree.selection()
-        if not sel or sel[0] != iid:
-            self.tree.selection_set(iid)
-            self.tree.see(iid)
-            self._on_select_event(None)
+        self._start = max(0, self._start - self._page_size)
+        self._redraw()
 
-    def _on_click_checkbox(self, e: tk.Event):
-        if self.tree.identify_region(e.x, e.y) != "cell":
+    def _next(self):
+        if self._start + self._page_size >= len(self._rows):
             return
-        col = self.tree.identify_column(e.x)
-        if col not in ("#1", "#3"):
-            return
-        iid = self.tree.identify_row(e.y)
-        if not iid:
-            return
-        if col == "#1":
-            cur = self._kchk.get(iid, False)
-            self._kchk[iid] = not cur
-            self.tree.set(iid, "keep_sel", "☑" if not cur else "☐")
-        elif col == "#3":
-            cur = self._cchk.get(iid, False)
-            self._cchk[iid] = not cur
-            self.tree.set(iid, "cand_sel", "☑" if not cur else "☐")
-        # 選択も合わせて更新（プレビュー連動）
-        self.tree.selection_set(iid)
-        self.tree.see(iid)
-        self._on_select_event(None)
+        self._start = self._start + self._page_size
+        self._redraw()
 
-    def _on_select_event(self, e: Optional[tk.Event]):
-        kp, cp = self.current_pair_paths()
-        self._on_select(kp, cp)
+    def load(self, rows: List[Dict[str, Any]]):
+        self._rows = rows or []
+        self._start = 0
+        self._kchk.clear()
+        self._cchk.clear()
+        self._iid_keep.clear()
+        self._iid_cand.clear()
+        self._redraw()
 
-    def _on_double_click(self, e: tk.Event):
-        iid = self.tree.identify_row(e.y)
-        if not iid:
-            return
-        col = self.tree.identify_column(e.x)
-        if col == "#2" and self._on_open_keep:
-            p = self._keep.get(iid, "")
-            if p:
-                self._on_open_keep(p)
-        elif col == "#4" and self._on_open_cand:
-            p = self._cand.get(iid, "")
-            if p:
-                self._on_open_cand(p)
-
-    def _dist_of(self, r: Dict[str, str]) -> Optional[int]:
-        rel = r.get("relation") or ""
-        try:
+    def _redraw(self):
+        tv = self.tree
+        for iid in tv.get_children(""):
+            tv.delete(iid)
+        end = min(len(self._rows), self._start + self._page_size)
+        view = self._rows[self._start:end]
+        for r in view:
+            keep = r.get("keep") or ""
+            cand = r.get("candidate") or ""
+            kname = os.path.basename(keep)
+            cname = os.path.basename(cand)
+            # relationから距離
+            dist = "-"
+            rel = str(r.get("relation") or "")
             for part in rel.split(";"):
                 part = part.strip()
                 if part.startswith("dist="):
-                    return int(part.split("=", 1)[1])
-        except Exception:
-            pass
-        return None
-
-    # ---- API ----
-    def load(self, rows: List[Dict[str, str]]):
-        # 距離が小さい順（＝一致度が高い順）
-        self._rows = sorted(rows, key=lambda r: (self._dist_of(r) if self._dist_of(r) is not None else 10**9))
-        self._page = 0
-        self._render_page()
-
-    def _render_page(self):
-        for iid in self.tree.get_children(""):
-            self.tree.delete(iid)
-        self._keep.clear()
-        self._cand.clear()
-        self._kchk.clear()
-        self._cchk.clear()
-        self._dist.clear()
-
-        total = len(self._rows)
-        pages = max(1, (total + self._page_size - 1) // self._page_size)
-        self._page = max(0, min(self._page, pages - 1))
-        self._lbl_pg.config(text=f"ページ {self._page + 1}/{pages}")
-
-        start = self._page * self._page_size
-        end = min(total, start + self._page_size)
-
-        first_iid = None
-        for r in self._rows[start:end]:
-            kp = r.get("keep") or ""
-            cp = r.get("candidate") or ""
-            d = self._dist_of(r)
-            sim = "-" if d is None else f"{(64 - d) * 100.0 / 64.0:.1f}%"
-            iid = self.tree.insert("", tk.END, values=("☐", os.path.basename(kp), "☐", os.path.basename(cp), sim))
-            if first_iid is None:
-                first_iid = iid
-            self._keep[iid] = kp
-            self._cand[iid] = cp
+                    try:
+                        dist = str(int(part.split("=", 1)[1]))
+                    except Exception:
+                        pass
+            iid = tv.insert("", tk.END, values=("☐", kname, "☐", cname, dist))
+            self._iid_keep[iid] = keep
+            self._iid_cand[iid] = cand
             self._kchk[iid] = False
             self._cchk[iid] = False
-            if d is not None:
-                self._dist[iid] = d
+        self.lbl_page.config(
+            text=f"ページ {self._start // self._page_size + 1} / {max(1, math.ceil(len(self._rows) / self._page_size))}"
+        )
 
-        if first_iid:
-            self.tree.selection_set(first_iid)
-            self.tree.see(first_iid)
-            self._on_select_event(None)
+    def _on_sel(self, _e=None):
+        sel = self.tree.selection()
+        if not sel:
+            self._on_select(None, None)
+            return
+        iid = sel[0]
+        self._on_select(self._iid_keep.get(iid), self._iid_cand.get(iid))
 
-        self._btn_prev.config(state=(tk.NORMAL if self._page > 0 else tk.DISABLED))
-        self._btn_next.config(state=(tk.NORMAL if self._page < pages - 1 else tk.DISABLED))
+    def _toggle_check(self, e: tk.Event):
+        tv = self.tree
+        if tv.identify("region", e.x, e.y) != "cell":
+            return
+        col = tv.identify_column(e.x)
+        iid = tv.identify_row(e.y)
+        if not iid:
+            return
+        if col == "#1":  # 保持✓
+            cur = self._kchk.get(iid, False)
+            self._kchk[iid] = not cur
+            tv.set(iid, "kchk", "☑" if not cur else "☐")
+        elif col == "#3":  # 候補✓
+            cur = self._cchk.get(iid, False)
+            self._cchk[iid] = not cur
+            tv.set(iid, "cchk", "☑" if not cur else "☐")
 
-    def next_page(self):
-        self._page += 1
-        self._render_page()
+    def _on_open_file(self, e: Optional[tk.Event] = None):
+        """ダブルクリックした列に応じて保持/候補を開く"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        col = None
+        if e is not None:
+            col = self.tree.identify_column(e.x)
+        # 列が分かればそれに合わせる、無ければ保持優先
+        if col == "#2":
+            p = self._iid_keep.get(iid)
+            if p:
+                try:
+                    self._open_keep(p)
+                except Exception:
+                    pass
+        elif col == "#4":
+            p = self._iid_cand.get(iid)
+            if p:
+                try:
+                    self._open_cand(p)
+                except Exception:
+                    pass
+        else:
+            p = self._iid_keep.get(iid) or self._iid_cand.get(iid)
+            if p:
+                try:
+                    self._open_keep(p)
+                except Exception:
+                    pass
 
-    def prev_page(self):
-        self._page -= 1
-        self._render_page()
+    def selected_paths(self) -> List[str]:
+        """保持✓と候補✓の両方を返す（ごみ箱対象）"""
+        out: List[str] = []
+        for iid, p in self._iid_keep.items():
+            if self._kchk.get(iid, False):
+                out.append(p)
+        for iid, p in self._iid_cand.items():
+            if self._cchk.get(iid, False):
+                out.append(p)
+        return out
+
+    def remove_by_paths(self, paths: List[str] | set[str]):
+        tv = self.tree
+        to_remove = [iid for iid, p in list(self._iid_keep.items()) if p in paths]
+        to_remove += [iid for iid, p in list(self._iid_cand.items()) if p in paths]
+        for iid in set(to_remove):
+            if tv.exists(iid):
+                tv.delete(iid)
+            self._kchk.pop(iid, None)
+            self._cchk.pop(iid, None)
+            self._iid_keep.pop(iid, None)
+            self._iid_cand.pop(iid, None)
 
     def current_pair_paths(self) -> Tuple[Optional[str], Optional[str]]:
         sel = self.tree.selection()
         if not sel:
             return (None, None)
         iid = sel[0]
-        return (self._keep.get(iid), self._cand.get(iid))
-
-    def selected_paths(self) -> set[str]:
-        out: Set[str] = set()
-        for iid, on in self._kchk.items():
-            if on:
-                p = self._keep.get(iid, "")
-                if p:
-                    out.add(p)
-        for iid, on in self._cchk.items():
-            if on:
-                p = self._cand.get(iid, "")
-                if p:
-                    out.add(p)
-        return out
-
-    def remove_by_paths(self, paths: set[str]):
-        to_remove = []
-        for iid, kp in list(self._keep.items()):
-            cp = self._cand.get(iid, "")
-            if kp in paths or cp in paths:
-                to_remove.append(iid)
-        for iid in to_remove:
-            if self.tree.exists(iid):
-                self.tree.delete(iid)
-            self._kchk.pop(iid, None)
-            self._cchk.pop(iid, None)
-            self._keep.pop(iid, None)
-            self._cand.pop(iid, None)
-            self._dist.pop(iid, None)
+        return (self._iid_keep.get(iid), self._iid_cand.get(iid))

@@ -1,1 +1,1 @@
-__version__ = "0.1.0"
+from .detectors import detect_blur_paths  # 新デフォルトAPI

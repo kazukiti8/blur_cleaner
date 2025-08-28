@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blur-cleaner"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["opencv-python", "numpy", "pandas", "pyyaml"]
+
+[project.scripts]
+blur-cleaner = "blur_cleaner.cli:main"
+
+# ★★ ここがポイント（パッケージ検出の指示）★★
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["blur_cleaner*"]
+exclude = ["tests*", "scripts*", "examples*", "config*"]
+
+# ★★ YAMLをパッケージに同梱する指定 ★★
+[tool.setuptools.package-data]
+blur_cleaner = ["config/*.yaml"]

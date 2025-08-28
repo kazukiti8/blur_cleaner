@@ -1,0 +1,14 @@
+gauss_ksize: 3
+gauss_sigma: 0.0
+scales: [1.0, 0.5, 0.25]
+lap_ksize: 3
+agg: median
+threshold: 800
+auto_th: percentile
+auto_param: 25.0
+and_tenengrad: true
+ten_ksize: 3
+ten_threshold: 800
+ten_auto_th: percentile
+ten_auto_param: 25.0
+max_side: 2000

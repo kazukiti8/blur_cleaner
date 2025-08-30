@@ -34,6 +34,7 @@ class TabbedSettingsDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
+        self.result = None
 
         # 値
         self.var_target    = tk.StringVar(value=target_dir)

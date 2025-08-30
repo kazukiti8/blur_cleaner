@@ -1,8 +1,33 @@
-.venv/
+# ---- Python 基本 ----
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.DS_Store
+*.py[cod]
+*$py.class
+
+# ---- 仮想環境 ----
+.venv/
+env/
+venv/
+
+# ---- ビルド成果物 (PyInstaller / build) ----
+/build/
+/dist/
+*.spec
+
+# ---- キャッシュ/ログ ----
+*.log
+*.sqlite
 *.db
-report.csv
+*.pkl
+*.tmp
+
+# ---- OSごとの不要ファイル ----
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+desktop.ini
+
+# ---- IDE/エディタ ----
+.vscode/
+.idea/
+*.swp

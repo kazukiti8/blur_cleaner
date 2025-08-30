@@ -1,153 +1,222 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import os
+
 import tkinter as tk
-from tkinter import ttk
-from typing import Dict, Any, Optional
+import tkinter.ttk as ttk
+from typing import Optional, Dict, Any
 
-__all__ = ["TabbedSettingsDialog"]
 
-FIXED_EXT_TEXT = ".jpeg;.jpg;.png;.webp"
+class LabeledEntry(ttk.Frame):
+    def __init__(self, master, text: str, width: int = 8, initial: str = ""):
+        super().__init__(master)
+        ttk.Label(self, text=text).pack(side=tk.LEFT, padx=(0, 8))
+        self.var = tk.StringVar(value=initial)
+        e = ttk.Entry(self, textvariable=self.var, width=width)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=False)
+        self.entry = e
+
+    def get_str(self) -> str:
+        return self.var.get()
+
+    def get_float(self, default: float) -> float:
+        v = self.get_str().strip()
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def get_int(self, default: int) -> int:
+        v = self.get_str().strip()
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+
+class LabeledSpin(ttk.Frame):
+    def __init__(self, master, text: str, from_: int, to: int, initial: int):
+        super().__init__(master)
+        ttk.Label(self, text=text).pack(side=tk.LEFT, padx=(0, 8))
+        self.var = tk.IntVar(value=initial)
+        sp = ttk.Spinbox(self, from_=from_, to=to, textvariable=self.var, width=6)
+        sp.pack(side=tk.LEFT)
+        self.spin = sp
+
+    def get_int(self, default: Optional[int] = None) -> int:
+        """
+        例外時は default があればそれ、なければ 0 を返す。
+        既存コードで get_int(25) のように呼んでいる箇所に対応。
+        """
+        try:
+            return int(self.var.get())
+        except Exception:
+            try:
+                return int(self.spin.get())
+            except Exception:
+                return int(default) if default is not None else 0
+
+
+class LabeledScale(ttk.Frame):
+    def __init__(self, master, text: str, from_: float, to: float, resolution: float, initial: float, fmt="{:.2f}"):
+        super().__init__(master)
+        ttk.Label(self, text=text).pack(side=tk.LEFT, padx=(0, 8))
+        self.var = tk.DoubleVar(value=initial)
+        self.scale = ttk.Scale(self, from_=from_, to=to, orient="horizontal", variable=self.var)
+        self.scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
+        self.lbl = ttk.Label(self, text=fmt.format(initial))
+        self.lbl.pack(side=tk.LEFT)
+        self.resolution = resolution
+        self.fmt = fmt
+        self.scale.bind("<B1-Motion>", self._on_change)
+        self.scale.bind("<ButtonRelease-1>", self._on_change)
+
+    def _on_change(self, _e=None):
+        v = float(self.var.get())
+        r = self.resolution
+        v = round(v / r) * r
+        self.var.set(v)
+        self.lbl.config(text=self.fmt.format(v))
+
+    def get_float(self) -> float:
+        return float(self.var.get())
+
 
 class TabbedSettingsDialog(tk.Toplevel):
     """
-    タブ: スキャン条件 / ブレ設定
-    ※ キャッシュDBは target_dir/scan_cshe に固定（表示のみ）
-    ※ 拡張子は固定: jpeg / jpg / png / webp
-    ※ 類似判定は常時ONのためUIは無し
+    設定ダイアログ（ブレ+類似）
     """
-    def __init__(self, master,
-                 target_dir: str,
-                 include: str,
-                 exclude: str,
-                 blur_auto: bool,
-                 blur_pct: int,
-                 blur_thr: float,
-                 # 追加（新方式）
-                 and_tenengrad: bool = True,
-                 ms_mode: str = "fixed",
-                 ms_param: float = 25.0,
-                 ten_mode: str = "fixed",
-                 ten_thr: float = 800.0,
-                 ten_param: float = 25.0):
+    def __init__(
+        self,
+        master,
+        *,
+        target_dir: str = "",
+        include: str = "",
+        exclude: str = "",
+        blur_auto: bool = False,
+        blur_pct: int = 25,
+        blur_thr: float = 800.0,
+        and_tenengrad: bool = True,
+        ms_mode: str = "fixed",
+        ms_param: float = 25.0,
+        ten_mode: str = "fixed",
+        ten_thr: float = 800.0,
+        ten_param: float = 25.0,
+
+        # 類似（初期値）
+        init_phash_dist: int = 8,
+        init_dhash_dist: int = 12,
+        init_mnn_k:     int = 3,
+        init_ssim_thr:  float = 0.88,
+        init_ssim_max:  int = 300,
+        init_hsv_corr:  float = 0.90,
+    ):
         super().__init__(master)
         self.title("オプション")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
-        self.result = None
+        self.result: Optional[Dict[str, Any]] = None
 
-        # 値
-        self.var_target    = tk.StringVar(value=target_dir)
-        self.var_include   = tk.StringVar(value=FIXED_EXT_TEXT)  # 固定表示のみ
-        self.var_exclude   = tk.StringVar(value=exclude)
-        self.var_cacheinfo = tk.StringVar(value=self._build_cache_info(target_dir))
+        nb = ttk.Notebook(self)
+        nb.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
-        # 旧UI（MS側にマッピング）
-        self.var_blur_auto = tk.BooleanVar(value=blur_auto)
-        self.var_blur_pct  = tk.IntVar(value=blur_pct)
-        self.var_blur_thr  = tk.DoubleVar(value=blur_thr)
+        # --- タブ1：ブレ ---
+        tab_blur = ttk.Frame(nb)
+        nb.add(tab_blur, text="ブレ判定")
 
-        # 新方式
-        self.var_and_ten   = tk.BooleanVar(value=and_tenengrad)
-        self.var_ms_mode   = tk.StringVar(value=ms_mode if ms_mode in ("fixed","percentile","zscore") else ("percentile" if blur_auto else "fixed"))
-        self.var_ms_param  = tk.DoubleVar(value=ms_param if ms_mode!="fixed" else float(blur_pct))
-        self.var_ms_fixed  = tk.DoubleVar(value=blur_thr)
-        self.var_ten_mode  = tk.StringVar(value=ten_mode if ten_mode in ("fixed","percentile","zscore") else "fixed")
-        self.var_ten_param = tk.DoubleVar(value=ten_param)
-        self.var_ten_fixed = tk.DoubleVar(value=ten_thr)
+        frm_b1 = ttk.Labelframe(tab_blur, text="多尺度ラプラシアン")
+        frm_b1.pack(fill=tk.X, padx=8, pady=8)
 
-        frm = ttk.Frame(self, padding=10); frm.pack(fill=tk.BOTH, expand=True)
-        nb = ttk.Notebook(frm); nb.pack(fill=tk.BOTH, expand=True)
+        self.var_ms_mode = tk.StringVar(value=ms_mode)  # "fixed" / "percentile" / "zscore"
+        self.var_and_ten = tk.BooleanVar(value=and_tenengrad)
 
-        # --- スキャン条件 ---
-        tab_scan = ttk.Frame(nb); nb.add(tab_scan, text="スキャン条件")
+        row1 = ttk.Frame(frm_b1); row1.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Radiobutton(row1, text="固定しきい値", value="fixed", variable=self.var_ms_mode).pack(side=tk.LEFT)
+        ttk.Radiobutton(row1, text="自動: パーセンタイル", value="percentile", variable=self.var_ms_mode).pack(side=tk.LEFT, padx=(12,0))
+        ttk.Radiobutton(row1, text="自動: z-score", value="zscore", variable=self.var_ms_mode).pack(side=tk.LEFT, padx=(12,0))
 
-        note = ttk.Label(
-            tab_scan,
-            text="対応拡張子：jpeg / jpg / png / webp のみ（固定）",
-            foreground="gray"
-        )
-        note.pack(anchor="w", padx=8, pady=(8, 4))
+        row2 = ttk.Frame(frm_b1); row2.pack(fill=tk.X, padx=8, pady=4)
+        self.ent_ms_thr  = LabeledEntry(row2, "固定しきい値(例:800)", width=8, initial=f"{blur_thr:.1f}")
+        self.ent_ms_thr.pack(side=tk.LEFT)
+        self.ent_ms_pct  = LabeledSpin(row2, "自動: パーセンタイル(%)", from_=1, to=50, initial=int(ms_param))
+        self.ent_ms_pct.pack(side=tk.LEFT, padx=(16,0))
 
-        trow = ttk.Frame(tab_scan); trow.pack(fill=tk.X, padx=6, pady=(2,0))
-        ttk.Label(trow, text="対象フォルダ:").pack(side=tk.LEFT)
-        ttk.Label(trow, textvariable=self.var_target, foreground="#444").pack(side=tk.LEFT, padx=(4,0))
+        frm_b2 = ttk.Labelframe(tab_blur, text="Tenengrad（AND条件で厳しめ）")
+        frm_b2.pack(fill=tk.X, padx=8, pady=8)
 
-        sec1 = ttk.LabelFrame(tab_scan, text="拡張子（固定）")
-        sec1.pack(fill=tk.X, padx=6, pady=(8,4))
-        ttk.Entry(sec1, textvariable=self.var_include, width=64, state="disabled").pack(fill=tk.X, padx=8, pady=6)
+        self.var_ten_mode = tk.StringVar(value=ten_mode)
+        row3 = ttk.Frame(frm_b2); row3.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Checkbutton(row3, text="Tenengradを併用（AND）", variable=self.var_and_ten).pack(side=tk.LEFT)
+        ttk.Radiobutton(row3, text="固定", value="fixed", variable=self.var_ten_mode).pack(side=tk.LEFT, padx=(24,0))
+        ttk.Radiobutton(row3, text="自動: パーセンタイル", value="percentile", variable=self.var_ten_mode).pack(side=tk.LEFT, padx=(12,0))
+        ttk.Radiobutton(row3, text="自動: z-score", value="zscore", variable=self.var_ten_mode).pack(side=tk.LEFT, padx=(12,0))
 
-        sec2 = ttk.LabelFrame(tab_scan, text="除外（パスに含む文字列を;区切り 例: thumb;backup;@eaDir）")
-        sec2.pack(fill=tk.X, padx=6, pady=(4,6))
-        ttk.Entry(sec2, textvariable=self.var_exclude, width=64).pack(fill=tk.X, padx=8, pady=6)
+        row4 = ttk.Frame(frm_b2); row4.pack(fill=tk.X, padx=8, pady=4)
+        self.ent_ten_thr  = LabeledEntry(row4, "固定しきい値(例:800)", width=8, initial=f"{ten_thr:.1f}")
+        self.ent_ten_thr.pack(side=tk.LEFT)
+        self.ent_ten_pct  = LabeledSpin(row4, "自動: パーセンタイル(%)", from_=1, to=50, initial=int(ten_param))
+        self.ent_ten_pct.pack(side=tk.LEFT, padx=(16,0))
 
-        info = ttk.LabelFrame(tab_scan, text="キャッシュ（自動）")
-        info.pack(fill=tk.X, padx=6, pady=(0,8))
-        ttk.Label(info, textvariable=self.var_cacheinfo, foreground="#555", justify="left").pack(fill=tk.X, padx=8, pady=6)
+        # --- タブ2：類似 ---
+        tab_sim = ttk.Frame(nb)
+        nb.add(tab_sim, text="類似判定")
 
-        # --- ブレ設定 ---
-        tab_blur = ttk.Frame(nb); nb.add(tab_blur, text="ブレ設定")
+        frm_h = ttk.Labelframe(tab_sim, text="距離（ハッシュ半径）")
+        frm_h.pack(fill=tk.X, padx=8, pady=(8,4))
+        self.sp_phash = LabeledSpin(frm_h, "pHash 半径", from_=2, to=32, initial=init_phash_dist)
+        self.sp_phash.pack(side=tk.LEFT, padx=8, pady=4)
+        self.sp_dhash = LabeledSpin(frm_h, "dHash 半径", from_=2, to=32, initial=init_dhash_dist)
+        self.sp_dhash.pack(side=tk.LEFT, padx=8, pady=4)
 
-        b0 = ttk.Frame(tab_blur); b0.pack(fill=tk.X, padx=6, pady=(8,2))
-        ttk.Checkbutton(b0, text="AND(Tenengrad併用)", variable=self.var_and_ten).pack(side=tk.LEFT)
+        frm_m = ttk.Labelframe(tab_sim, text="MNN（相互トップK）")
+        frm_m.pack(fill=tk.X, padx=8, pady=(4,4))
+        self.sp_mnnk = LabeledSpin(frm_m, "K", from_=1, to=10, initial=init_mnn_k)
+        self.sp_mnnk.pack(side=tk.LEFT, padx=8, pady=4)
 
-        # MS（多尺度）
-        msf = ttk.LabelFrame(tab_blur, text="多尺度ラプラシアン（MS）しきい値")
-        msf.pack(fill=tk.X, padx=6, pady=(8,4))
-        r1 = ttk.Frame(msf); r1.pack(fill=tk.X, padx=6, pady=6)
-        ttk.Radiobutton(r1, text="固定値", variable=self.var_ms_mode, value="fixed").pack(side=tk.LEFT)
-        ttk.Entry(r1, textvariable=self.var_ms_fixed, width=10).pack(side=tk.LEFT, padx=(6,12))
-        ttk.Radiobutton(r1, text="Percentile(%)", variable=self.var_ms_mode, value="percentile").pack(side=tk.LEFT)
-        ttk.Entry(r1, textvariable=self.var_ms_param, width=6).pack(side=tk.LEFT, padx=(6,12))
-        ttk.Radiobutton(r1, text="Z-score(α)", variable=self.var_ms_mode, value="zscore").pack(side=tk.LEFT)
-        ttk.Entry(r1, textvariable=self.var_ms_param, width=6).pack(side=tk.LEFT, padx=(6,12))
+        frm_s = ttk.Labelframe(tab_sim, text="SSIM 最終フィルタ")
+        frm_s.pack(fill=tk.X, padx=8, pady=(4,4))
+        self.sc_ssim = LabeledScale(frm_s, "SSIM閾値", 0.70, 0.98, 0.01, initial=init_ssim_thr, fmt="{:.2f}")
+        self.sc_ssim.pack(fill=tk.X, padx=8, pady=4)
+        self.sp_ssim_n = LabeledSpin(frm_s, "SSIM検査件数(上位N)", from_=20, to=1000, initial=init_ssim_max)
+        self.sp_ssim_n.pack(side=tk.LEFT, padx=8, pady=4)
 
-        # Tenengrad
-        tenf = ttk.LabelFrame(tab_blur, text="Tenengrad（勾配）しきい値")
-        tenf.pack(fill=tk.X, padx=6, pady=(4,8))
-        r2 = ttk.Frame(tenf); r2.pack(fill=tk.X, padx=6, pady=6)
-        ttk.Radiobutton(r2, text="固定値", variable=self.var_ten_mode, value="fixed").pack(side=tk.LEFT)
-        ttk.Entry(r2, textvariable=self.var_ten_fixed, width=10).pack(side=tk.LEFT, padx=(6,12))
-        ttk.Radiobutton(r2, text="Percentile(%)", variable=self.var_ten_mode, value="percentile").pack(side=tk.LEFT)
-        ttk.Entry(r2, textvariable=self.var_ten_param, width=6).pack(side=tk.LEFT, padx=(6,12))
-        ttk.Radiobutton(r2, text="Z-score(α)", variable=self.var_ten_mode, value="zscore").pack(side=tk.LEFT)
-        ttk.Entry(r2, textvariable=self.var_ten_param, width=6).pack(side=tk.LEFT, padx=(6,12))
+        frm_c = ttk.Labelframe(tab_sim, text="色ヒスト相関（HSV）")
+        frm_c.pack(fill=tk.X, padx=8, pady=(4,8))
+        self.sc_hsv = LabeledScale(frm_c, "相関の下限", 0.70, 0.99, 0.01, initial=init_hsv_corr, fmt="{:.2f}")
+        self.sc_hsv.pack(fill=tk.X, padx=8, pady=4)
 
-        # OK/Cancel
-        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(10,0))
-        ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btns, text="キャンセル", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+        # --- ボタン列 ---
+        row_btn = ttk.Frame(self)
+        row_btn.pack(fill=tk.X, padx=12, pady=(0,12))
+        ttk.Button(row_btn, text="OK", command=self._ok).pack(side=tk.RIGHT, padx=(8,0))
+        ttk.Button(row_btn, text="キャンセル", command=self._cancel).pack(side=tk.RIGHT)
 
-        self._sync_blur_state()
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self._cancel())
 
-    def _build_cache_info(self, target_dir: str) -> str:
-        try:
-            path = os.path.join(target_dir or "", "scan_cache")
-            return f"DB: {path}（自動）"
-        except Exception:
-            return "DB: -"
-
-    def _sync_blur_state(self):
-        # 旧UIとの整合を保つ（MS側を代表とする）
-        auto = bool(self.var_ms_mode.get() != "fixed")
-        self.var_blur_auto.set(auto)
+        self.update_idletasks()
+        self.minsize(self.winfo_width(), self.winfo_height())
+        self.focus_set()
 
     def _ok(self):
-        self.result = dict(
-            include=self.var_include.get().strip(),  # 固定（互換のため返す）
-            exclude=self.var_exclude.get().strip(),
-            # 互換キー（旧UIの呼び出しに対応）
-            blur_auto=bool(self.var_blur_auto.get()),
-            blur_pct=int(self.var_blur_pct.get()),
-            blur_thr=float(self.var_blur_thr.get()),
-            # 新キー
-            and_tenengrad=bool(self.var_and_ten.get()),
-            ms_mode=self.var_ms_mode.get(),
-            ms_param=float(self.var_ms_param.get()),
-            ten_mode=self.var_ten_mode.get(),
-            ten_thr=float(self.var_ten_fixed.get()),
-            ten_param=float(self.var_ten_param.get()),
-        )
+        self.result = {
+            # ブレ
+            "ms_mode": self.var_ms_mode.get(),
+            "ms_param": float(self.ent_ms_pct.get_int(25)),
+            "blur_thr": float(self.ent_ms_thr.get_float(800.0)),
+            "and_tenengrad": bool(self.var_and_ten.get()),
+            "ten_mode": self.var_ten_mode.get(),
+            "ten_param": float(self.ent_ten_pct.get_int(25)),
+            "ten_thr": float(self.ent_ten_thr.get_float(800.0)),
+
+            # 類似
+            "phash_dist": int(self.sp_phash.get_int(8)),
+            "dhash_dist": int(self.sp_dhash.get_int(12)),
+            "mnn_k": int(self.sp_mnnk.get_int(3)),
+            "ssim_thresh": float(self.sc_ssim.get_float()),
+            "ssim_maxpairs": int(self.sp_ssim_n.get_int(300)),
+            "hsv_corr": float(self.sc_hsv.get_float()),
+        }
         self.destroy()
 
     def _cancel(self):
